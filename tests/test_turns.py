@@ -64,5 +64,28 @@ class SplitSentencesTest(unittest.TestCase):
         self.assertEqual(split_sentences("   "), [])
 
 
+class InterruptPreservesUtteranceTest(unittest.TestCase):
+    """Pins the state path the server relies on when end_utterance arrives
+    while a previous turn is still running: interrupt the old turn, then
+    accept the preserved new audio as a fresh turn (never drop it)."""
+
+    def test_cancel_then_begin_accepts_new_audio(self):
+        from app.turns import TurnState
+
+        s = TurnState()
+        s.begin_turn()
+        s.add_audio(320, 1_000_000)
+        s.transition("processing")
+        # Server: end_turn_state("interrupted") + begin_turn().
+        cancelled = s.cancel()
+        self.assertIsNotNone(cancelled)
+        tid2 = s.begin_turn()
+        s.add_audio(640, 1_000_000)  # preserved utterance bytes
+        self.assertEqual(s.turn_id, tid2)
+        self.assertEqual(s.turn_bytes, 640)
+        self.assertEqual(s.state, "collecting")
+        self.assertFalse(s.is_current(cancelled))
+
+
 if __name__ == "__main__":
     unittest.main()

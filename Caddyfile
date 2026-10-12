@@ -11,11 +11,14 @@ voice.jamesugbanu.com {
 	encode gzip
 
 	@voice_api {
-		path /v1/sessions /v1/voice /healthz /metrics
+		path /v1/sessions /v1/voice /healthz
 	}
 	handle @voice_api {
 		reverse_proxy voice:8000 {
-			header_up X-Forwarded-For {http.request.header.X-Forwarded-For}
+			# Caddy is the edge: overwrite any client-supplied value so
+			# X-Forwarded-For always carries the true peer IP for attempt
+			# buckets. (Per-visitor quotas remain the primary control.)
+			header_up X-Forwarded-For {http.request.remote.host}
 			header_up X-Forwarded-Proto {http.request.scheme}
 			transport http {
 				read_timeout 120s

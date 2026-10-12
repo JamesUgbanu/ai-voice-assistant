@@ -10,7 +10,7 @@ can enforce the per-turn cap before buffering unbounded input.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 IDLE = "idle"

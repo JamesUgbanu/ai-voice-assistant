@@ -141,3 +141,14 @@ def make_envelope(event_type: str, payload: dict | None = None, *, seq: int = 0,
 
 def is_fatal_error(code: string) -> bool:
     return code in FATAL_ERRORS
+
+
+#: Minimum seconds between answered pings. Session liveness is rechecked
+#: on heartbeats regardless — this only stops a ping flood from becoming
+#: a database flood, since each answered ping touches the session row.
+PING_MIN_INTERVAL_SECONDS = 1.0
+
+
+def should_answer_ping(last_answered_at: float, now: float) -> bool:
+    """Throttle ping responses without affecting liveness checks."""
+    return now - last_answered_at >= PING_MIN_INTERVAL_SECONDS

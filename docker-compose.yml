@@ -7,8 +7,11 @@ services:
     image: james-voice-service:0.1.0
     container_name: james-voice
     restart: unless-stopped
-    user: "1000:1000"
-    # Two cores is the measured budget; adjust after Phase 2 benchmarks.
+    # No `user:` override: the image already runs as the non-root `voice`
+    # user, which owns /srv/voice. Overriding the uid here would break
+    # writes to the voice-data and voice-models volumes.
+    # Two cores is the planning budget pending Phase 2 benchmarks on the
+    # actual chip — adjust after measured RTF/headroom, not before.
     cpus: 2.0
     mem_limit: 10g
     mem_reservation: 6g

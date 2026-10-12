@@ -10,6 +10,7 @@ from app.protocol import (
     SERVER_EVENTS,
     is_fatal_error,
     make_envelope,
+    should_answer_ping,
     validate_audio_frame,
     validate_envelope,
     ProtocolError,
@@ -81,6 +82,18 @@ class AudioFrameTest(unittest.TestCase):
             validate_audio_frame({"audio_b64": self._b64(320)}, max_frame_bytes=4096,
                                  max_turn_bytes=500, turn_bytes_so_far=400)
         self.assertEqual(ctx2.exception.code, "turn_too_long")
+
+
+class PingThrottleTest(unittest.TestCase):
+    def test_first_ping_always_answered(self):
+        self.assertTrue(should_answer_ping(0.0, 100.0))
+
+    def test_rapid_repeat_ignored(self):
+        self.assertFalse(should_answer_ping(100.0, 100.5))
+
+    def test_answered_again_after_interval(self):
+        self.assertTrue(should_answer_ping(100.0, 101.0))
+        self.assertTrue(should_answer_ping(100.0, 200.0))
 
 
 if __name__ == "__main__":

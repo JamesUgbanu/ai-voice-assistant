@@ -23,8 +23,8 @@ Headers: `Content-Type: application/json`, `Authorization: Bearer <VOICE_RAG_SER
 ```
 
 The voice service sends `{question, history: [], debug: false}` — the
-Cartesia agent equivalent holds conversation server-side, so each voice
-turn is self-contained. History is accepted by the schema but unused.
+voice agent holds conversation server-side, so each voice turn is
+self-contained. History is accepted by the schema but unused.
 
 ## Response: Server-Sent Events
 
@@ -86,8 +86,8 @@ data: {"metrics":{"route":"knowledge", ...}}
 ```
 
 The voice client folds `token` frames into one answer string, compacts
-whitespace/markdown, caps at 2800 chars (well under Cartesia-style 4 KB
-downstream ceilings), and treats empty/error streams as a spoken
+whitespace/markdown, caps at 2800 chars (compact enough for spoken
+delivery and small webhook-style payloads), and treats empty/error streams as a spoken
 apology — never fabricated text.
 
 ## What the voice service must never do

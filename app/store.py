@@ -86,11 +86,15 @@ def recover_stale(conn: sqlite3.Connection, *, now: float, stale_after_seconds: 
     return count
 
 
-def _usage_seconds(conn: sqlite3.Connection, visitor_id: str, day_start: float, max_seconds: int) -> float:
+def _usage_seconds(
+    conn: sqlite3.Connection, visitor_id: str, day_start: float, max_seconds: int, now: float
+) -> float:
     """Session active-time consumed since day_start (UTC), each session capped
     at max_seconds. Active time (not audio time) is the documented allowance
-    metric: simple, auditable, impossible to game by staying silent. Negative
-    clock-skew intervals are clamped to zero."""
+    metric: simple, auditable, impossible to game by staying silent. Live
+    sessions accrue against the current time; negative clock-skew intervals
+    are clamped to zero. Sessions straddling UTC midnight count only in the
+    day they started (safe direction: undercounts, never overcharges)."""
     row = conn.execute(
         """SELECT COALESCE(SUM(
              CASE WHEN COALESCE(ended_at, ?1) > started_at
@@ -100,7 +104,7 @@ def _usage_seconds(conn: sqlite3.Connection, visitor_id: str, day_start: float, 
            FROM sessions
            WHERE visitor_id = ?3 AND started_at IS NOT NULL AND started_at >= ?4
              AND status IN ('active', 'ended', 'expired')""",
-        (day_start, max_seconds, visitor_id, day_start),
+        (now, max_seconds, visitor_id, day_start),
     ).fetchone()
     return max(0.0, float(row[0] or 0.0))
 
@@ -130,7 +134,7 @@ def create_session(
         ).fetchone()
         if live:
             raise SessionError("active_session", "A voice session is already active for this visitor.")
-        used = _usage_seconds(conn, visitor_id, _day_start_utc(now), max_seconds)
+        used = _usage_seconds(conn, visitor_id, _day_start_utc(now), max_seconds, now)
         if used >= daily_allowance_seconds:
             raise SessionError("daily_quota", "Daily voice allowance exhausted.")
         session_id = uuid.uuid4().hex
@@ -195,7 +199,7 @@ def count_attempts(conn: sqlite3.Connection, ip_hash: str, now: float, window_se
 
 
 def usage_today(conn: sqlite3.Connection, visitor_id: str, now: float, max_seconds: int) -> float:
-    return _usage_seconds(conn, visitor_id, _day_start_utc(now), max_seconds)
+    return _usage_seconds(conn, visitor_id, _day_start_utc(now), max_seconds, now)
 
 
 def current_time() -> float:

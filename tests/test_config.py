@@ -18,6 +18,11 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(s.stale_session_seconds, 600)
         self.assertEqual(s.sample_rate, 16000)
         self.assertEqual(s.stt_model, "small.en")
+        self.assertEqual(s.vad_source, "snakers4/silero-vad")
+        self.assertEqual(
+            Settings(env={"VOICE_VAD_SOURCE": "local:/srv/voice/vendor/silero"}).vad_source,
+            "local:/srv/voice/vendor/silero",
+        )
         self.assertEqual(s.tts_language, "english")
         self.assertEqual(s.allowed_origins, ["https://www.jamesugbanu.com"])
         self.assertFalse(s.rag_configured)

@@ -29,6 +29,7 @@ from .pipeline import run_turn
 from .protocol import (
     is_fatal_error,
     make_envelope,
+    should_answer_ping,
     validate_audio_frame,
     validate_envelope,
 )
@@ -91,7 +92,7 @@ async def get_models(use_stubs: bool = False):
             _models = {
                 "stt": FasterWhisperBackend(),
                 "tts": PocketTtsBackend(),
-                "vad": SileroVadBackend(),
+                "vad": SileroVadBackend(source=settings.vad_source),
             }
         return _models
 
@@ -275,6 +276,10 @@ def _ticket_secret() -> str:
 
 
 def _client_ip(request: Request) -> str:
+    # Trust model: Caddy overwrites X-Forwarded-For with the true peer IP,
+    # so first-entry is correct in production. Direct container access could
+    # spoof this, but it only feeds the attempt-rate bucket — per-visitor
+    # quotas and the active-session guard do not depend on IP at all.
     fwd = request.headers.get("x-forwarded-for", "")
     if fwd:
         first = fwd.split(",")[0].strip()
@@ -322,6 +327,7 @@ async def _handle_socket(websocket: WebSocket) -> None:
     turn_cancel: asyncio.Event | None = None
     turn_task: asyncio.Task | None = None
     audio_buf = bytearray()
+    last_ping_at = 0.0
     started_at = float(row["started_at"])
     max_seconds = int(row["max_seconds"])
 
@@ -451,6 +457,12 @@ async def _handle_socket(websocket: WebSocket) -> None:
             payload = env_msg["payload"]
 
             if etype == "ping":
+                # Throttled via protocol.should_answer_ping: session_alive()
+                # hits SQLite, so a ping flood must not become a DB flood.
+                # Heartbeat timeout below covers genuinely idle connections.
+                if not should_answer_ping(last_ping_at, time.time()):
+                    continue
+                last_ping_at = time.time()
                 if not await session_alive():
                     await send(make_envelope("session_ended", {"reason": "max_duration"}))
                     await db_call(store.end_session, session_id, time.time(), "max_duration")
@@ -461,8 +473,6 @@ async def _handle_socket(websocket: WebSocket) -> None:
                 if state.state == "idle":
                     state.begin_turn()
                 try:
-                    from .protocol import validate_audio_frame
-
                     max_turn = settings.max_turn_audio_seconds * settings.sample_rate * 2
                     raw_pcm = validate_audio_frame(
                         payload,
@@ -479,13 +489,14 @@ async def _handle_socket(websocket: WebSocket) -> None:
             elif etype == "end_utterance":
                 if state.state != "collecting":
                     continue
+                # Preserve this utterance's audio FIRST: if a previous turn
+                # is still running, interrupt it, then process the buffered
+                # utterance as the new turn instead of dropping it silently.
+                pcm = bytes(audio_buf)
+                audio_buf = bytearray()
                 if turn_task is not None and not turn_task.done():
                     await end_turn_state("interrupted")
                     state.begin_turn()
-                    audio_buf = bytearray()
-                    continue
-                pcm = bytes(audio_buf)
-                audio_buf = bytearray()
                 tid = state.turn_id
                 if tid is None:
                     continue
@@ -512,8 +523,12 @@ async def _handle_socket(websocket: WebSocket) -> None:
             elif etype == "hello":
                 await send(make_envelope("error", {"code": "bad_message", "message": "Session already open."}))
     except WebSocketDisconnect:
-        # Browser gone: leave the row active for stale recovery (usage still
-        # counts; next session attempt settles it). Never strand quota.
+        # Browser gone: cancel in-flight inference (bounded waste, no late
+        # audio after reconnect), then leave the row active for stale
+        # recovery (usage still counts; next session attempt settles it).
+        # Never strand quota.
+        if turn_task is not None and not turn_task.done():
+            turn_task.cancel()
         metric("disconnects")
         return
 

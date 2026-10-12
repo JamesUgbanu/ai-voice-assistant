@@ -18,14 +18,17 @@ dependencies = [
     # NOTE: install torch from the CPU index on Linux to avoid multi-GB
     # CUDA wheels: pip install torch --index-url https://download.pytorch.org/whl/cpu
     "torch>=2.5",
-    "silero-vad>=5.0",
+    # NOTE: Silero VAD has no PyPI distribution used here — it loads via
+    # torch.hub (pinned by VOICE_VAD_SOURCE, vendorable with local:).
+    # Do not `pip install silero-vad`; it is not this dependency.
     "numpy>=1.26",
     "scipy>=1.14",
     "httpx>=0.28",
 ]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+# Tests are stdlib unittest so they run without ANY third-party package:
+#   python3 -m unittest discover -s tests -v
+# (pytest is intentionally not a dependency.)
 
 [tool.ruff]
 line-length = 100

@@ -38,6 +38,7 @@ class Settings:
 
         self.stt_model: str = get("VOICE_STT_MODEL", "small.en")
         self.stt_fallback_model: str = get("VOICE_STT_FALLBACK_MODEL", "base.en")
+        self.vad_source: str = get("VOICE_VAD_SOURCE", "snakers4/silero-vad")
         self.tts_voice_ref: str = get("VOICE_TTS_VOICE_REF")
         self.tts_language: str = get("VOICE_TTS_LANGUAGE", "english")
 
@@ -65,8 +66,3 @@ class Settings:
     @property
     def rag_configured(self) -> bool:
         return bool(self.rag_api_url and self.rag_service_token)
-
-    @property
-    def tts_configured(self) -> bool:
-        # Model presence is verified at startup by the TTS adapter probe.
-        return True

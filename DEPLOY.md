@@ -42,6 +42,13 @@ First boot downloads model weights (faster-whisper checkpoint + Pocket
 TTS ~100M params + CPU torch); allow several minutes and ~5 GB disk.
 Record exact artifact versions in the Phase 2 benchmark table below.
 
+Health vs readiness: `/healthz` reports process liveness plus SQLite
+reachability only — models load lazily on first inference, so a healthy
+check does not mean STT/TTS are warm. Pre-warm with one real turn (or a
+`/v1/sessions` + short voice turn in staging) before opening traffic;
+model-load failures surface as explicit turn errors, never silent stubs
+(`VOICE_USE_STUBS=1` exists solely for offline unit tests).
+
 ## 4. Operate
 
 - Logs: `docker compose logs -f voice` (JSON, secrets/PII redacted by
