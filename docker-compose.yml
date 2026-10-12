@@ -1,0 +1,70 @@
+# Single-host deployment: Caddy terminates TLS and proxies ONLY the
+# documented public surface (/v1/sessions, /v1/voice, /healthz).
+# Model inference has no public route — it is in-process only.
+services:
+  voice:
+    build: .
+    image: james-voice-service:0.1.0
+    container_name: james-voice
+    restart: unless-stopped
+    user: "1000:1000"
+    # Two cores is the measured budget; adjust after Phase 2 benchmarks.
+    cpus: 2.0
+    mem_limit: 10g
+    mem_reservation: 6g
+    env_file:
+      - .env
+    environment:
+      VOICE_DB_PATH: /srv/voice/data/voice.sqlite3
+      HF_HOME: /srv/voice/models
+      OMP_NUM_THREADS: 2
+    volumes:
+      - voice-data:/srv/voice/data
+      - voice-models:/srv/voice/models
+    networks:
+      - voice-internal
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  caddy:
+    image: caddy:2.9-alpine
+    container_name: james-voice-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - voice-internal
+    depends_on:
+      voice:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  voice-internal:
+    driver: bridge
+
+volumes:
+  voice-data:
+  voice-models:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,32 @@
+[project]
+name = "james-voice-service"
+version = "0.1.0"
+description = "Self-hosted realtime English voice interface for jamesugbanu.com (separate service; portfolio RAG remains the sole knowledge source)."
+requires-python = ">=3.11"
+# Floors only. Exact pins are locked into uv.lock AFTER Phase 2 hardware
+# validation — pinning unverified versions here would be fiction. Do not
+# treat these floors as tested; see README "Model verification status".
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "pydantic>=2.10",
+    # STT shortlist (Phase 2 picks one on measured hardware):
+    "faster-whisper>=1.0",
+    "onnxruntime>=1.20",
+    # TTS candidate (Phase 2 validates on target CPU):
+    "pocket-tts>=0.2",
+    # NOTE: install torch from the CPU index on Linux to avoid multi-GB
+    # CUDA wheels: pip install torch --index-url https://download.pytorch.org/whl/cpu
+    "torch>=2.5",
+    "silero-vad>=5.0",
+    "numpy>=1.26",
+    "scipy>=1.14",
+    "httpx>=0.28",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

@@ -1,0 +1,41 @@
+# Public entry: voice.jamesugbanu.com → voice service only.
+# Requires DNS for voice.jamesugbanu.com to point at this host BEFORE
+# first boot so Caddy can complete the ACME challenge. If DNS is not
+# ready, comment out the tls directive temporarily (plain HTTP for local
+# verification only — never production traffic).
+voice.jamesugbanu.com {
+	tls {
+		protocols tls1.2 tls1.3
+	}
+
+	encode gzip
+
+	@voice_api {
+		path /v1/sessions /v1/voice /healthz /metrics
+	}
+	handle @voice_api {
+		reverse_proxy voice:8000 {
+			header_up X-Forwarded-For {http.request.header.X-Forwarded-For}
+			header_up X-Forwarded-Proto {http.request.scheme}
+			transport http {
+				read_timeout 120s
+				write_timeout 120s
+			}
+		}
+	}
+
+	# Everything else: closed. No directory listings, no model paths.
+	handle {
+		respond "Not found" 404
+	}
+
+	log {
+		output stdout
+		format filter {
+			fields {
+				request>headers>Cookie redact
+				request>headers>Authorization delete
+			}
+		}
+	}
+}
