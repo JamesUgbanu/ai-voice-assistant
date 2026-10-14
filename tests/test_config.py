@@ -17,7 +17,12 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(s.attempt_window_seconds, 600)
         self.assertEqual(s.stale_session_seconds, 600)
         self.assertEqual(s.sample_rate, 16000)
-        self.assertEqual(s.stt_model, "small.en")
+        self.assertEqual(s.stt_model, "base.en")
+        self.assertEqual(s.stt_beam_size, 1)
+        # Domain biasing is on by default: it restores proper-noun/technical
+        # accuracy (PostgreSQL, Chidera, Alimosho) that the faster model misses.
+        self.assertIn("PostgreSQL", s.stt_initial_prompt)
+        self.assertIn("Chidera", s.stt_initial_prompt)
         self.assertEqual(s.vad_source, "snakers4/silero-vad")
         self.assertEqual(
             Settings(env={"VOICE_VAD_SOURCE": "local:/srv/voice/vendor/silero"}).vad_source,

@@ -5,7 +5,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.vad import SileroVadBackend, max_window_score
+from app.vad import SileroVadBackend, max_window_score, window_pad
 
 
 class MaxWindowScoreTest(unittest.TestCase):
@@ -40,6 +40,28 @@ class SileroSourceTest(unittest.TestCase):
         self.assertEqual(SileroVadBackend()._source, "snakers4/silero-vad")
         self.assertEqual(SileroVadBackend(source="local:/srv/voice/vendor/silero")._source,
                          "local:/srv/voice/vendor/silero")
+
+
+class WindowPadTest(unittest.TestCase):
+    """Regression: Silero (TorchScript) raises 'Input audio chunk is too
+    short' on a final window < 512 samples, which failed every turn whose
+    length wasn't a multiple of 512. The adapter now pads the tail."""
+
+    def test_pads_to_next_full_window(self):
+        self.assertEqual(window_pad(0), 0)
+        self.assertEqual(window_pad(512), 0)
+        self.assertEqual(window_pad(1024), 0)
+        self.assertEqual(window_pad(1), 511)
+        self.assertEqual(window_pad(367), 145)
+        self.assertEqual(window_pad(513), 511)
+
+    def test_padded_length_is_always_a_whole_number_of_windows(self):
+        for n in (1, 367, 512, 513, 36207, 40000):
+            self.assertEqual((n + window_pad(n)) % 512, 0)
+
+    def test_non_positive_inputs_are_safe(self):
+        self.assertEqual(window_pad(-5), 0)
+        self.assertEqual(window_pad(100, window=0), 0)
 
 
 if __name__ == "__main__":

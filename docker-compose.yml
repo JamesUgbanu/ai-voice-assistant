@@ -21,6 +21,9 @@ services:
       VOICE_DB_PATH: /srv/voice/data/voice.sqlite3
       HF_HOME: /srv/voice/models
       OMP_NUM_THREADS: 2
+      # Bound glibc malloc arenas (multithreaded inference fragments and holds
+      # RSS that never returns to the OS). See Dockerfile for rationale.
+      MALLOC_ARENA_MAX: "2"
     volumes:
       - voice-data:/srv/voice/data
       - voice-models:/srv/voice/models

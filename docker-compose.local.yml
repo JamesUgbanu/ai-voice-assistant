@@ -1,0 +1,21 @@
+# Local-development overlay. NOT for production — invoke explicitly:
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up voice
+# Provides: host-gateway networking (Docker Desktop does not resolve
+# host.docker.internal by default), a published port for the local
+# browser, and local URLs in session responses.
+services:
+  voice:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8000:8000"
+    volumes:
+      # Authorized reference audio, mounted read-only. NOT baked into the
+      # image. Enable clone mode via VOICE_TTS_MODE/VOICE_TTS_VOICE_REF in .env.
+      - ./voice-reference/processed:/srv/voice/voice-reference/processed:ro
+    environment:
+      VOICE_PUBLIC_BASE_URL: http://localhost:8000
+      # Local browser origin(s). The portfolio dev server runs on :3000;
+      # :3001 is kept for a second explicit voice-test instance. Production
+      # origins come from VOICE_ALLOWED_ORIGINS in .env, untouched here.
+      VOICE_ALLOWED_ORIGINS: http://localhost:3000,http://localhost:3001

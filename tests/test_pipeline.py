@@ -9,7 +9,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.pipeline import run_turn
+from app.pipeline import run_turn, turn_end_reason
 from app.stt import StubSttBackend, SttConfig
 from app.tts import StubTtsBackend, TtsConfig
 from app.turns import TurnState
@@ -43,6 +43,7 @@ class RunTurnTest(unittest.IsolatedAsyncioTestCase):
             tts=self.tts, tts_config=self.tts_config,
             emit_audio_frame=self._emit,
             now_ms=lambda: kw.get("now", 1000),
+            on_transcript=kw.get("on_transcript", None),
         )
 
     async def test_full_turn_emits_speakable_audio(self):
@@ -143,9 +144,103 @@ class RunTurnTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [])
         self.assertEqual(result.transcript, "")
 
+    async def test_no_speech_transcript_skips_rag(self):
+        # A hallucination-guarded backend reports no_speech for garbage audio:
+        # no RAG request, no audio, clean idle — the client returns to
+        # listening instead of answering a hallucination.
+        from app.stt import SttBackend
+
+        class Guarded(SttBackend):
+            def transcribe(self, audio, config):
+                from app.stt import Transcript
+                return Transcript(text="", no_speech=True, avg_logprob=-1.5)
+
+        calls = []
+
+        async def rag_ask(text):
+            calls.append(text)
+            return "x"
+
+        s, tid = collecting()
+        result, _ = await self._run(s, tid, b"\x10\x00" * 800, rag_ask=rag_ask, stt=Guarded())
+        self.assertEqual(calls, [])
+        self.assertEqual(result.transcript, "")
+        self.assertFalse(result.cancelled)
+        self.assertIsNone(result.error)
+        self.assertEqual(self.frames, [])
+        self.assertEqual(s.state, "idle")
+
+    async def test_cancelled_turn_cannot_cancel_next(self):
+        # Interrupting turn 1 must not poison turn 2: each turn observes only
+        # its own cancellation event, so the next utterance starts clean.
+        s1, tid1 = collecting()
+        cancelled = asyncio.Event()
+        cancelled.set()
+        r1, _ = await run_turn(
+            state=s1, turn_id=tid1, audio=b"\x10\x00" * 800, cancelled=cancelled,
+            stt=self.stt, stt_config=self.stt_config, vad=self.vad,
+            vad_threshold=0.0, rag_ask=_ok_rag, tts=self.tts,
+            tts_config=self.tts_config, emit_audio_frame=self._emit,
+        )
+        self.assertTrue(r1.cancelled)
+        s2, tid2 = collecting()
+        r2, _ = await self._run(s2, tid2, b"\x10\x00" * 800)
+        self.assertFalse(r2.cancelled)
+        self.assertIsNone(r2.error)
+        self.assertEqual(r2.transcript, "hello james")
+        self.assertTrue(self.frames and self.frames[-1][1] is True)
+
+    async def test_transcript_hook_fires_once_with_final_text(self):
+        seen = []
+        s, tid = collecting()
+        result, _ = await self._run(s, tid, b"\x10\x00" * 800, on_transcript=seen.append)
+        self.assertFalse(result.cancelled)
+        self.assertEqual(seen, ["hello james"])
+
+    async def test_transcript_hook_skipped_for_empty_transcript(self):
+        from app.stt import SttBackend
+
+        class Silent(SttBackend):
+            def transcribe(self, audio, config):
+                from app.stt import Transcript
+                return Transcript(text="")
+
+        seen = []
+        s, tid = collecting()
+        await self._run(s, tid, b"\x10\x00" * 800, stt=Silent(), on_transcript=seen.append)
+        self.assertEqual(seen, [])
+
 
 async def _ok_rag(text: str) -> str:
     return f"Answer about {text}."
+
+
+class TurnEndReasonTest(unittest.TestCase):
+    """Regression: turn_end must come from the result, not state liveness.
+
+    A completed turn has already transitioned to idle, so the old
+    `state.is_current(turn_id)` gate was false and silently suppressed
+    turn_end(complete) and turn_end(error) — the client hung 'speaking' or
+    waited forever."""
+
+    def _r(self, **kw):
+        from app.pipeline import TurnResult
+        base = dict(turn_id="t1", transcript="hello", answer_text="hi", audio_frames=1)
+        base.update(kw)
+        return TurnResult(**base)
+
+    def test_success_is_complete(self):
+        self.assertEqual(turn_end_reason(self._r()), "complete")
+
+    def test_error_is_surfaced(self):
+        self.assertEqual(turn_end_reason(self._r(error="stt_failed")), "stt_failed")
+        self.assertEqual(turn_end_reason(self._r(error="rag_failed")), "rag_failed")
+
+    def test_cancelled_emits_nothing(self):
+        self.assertIsNone(turn_end_reason(self._r(cancelled=True)))
+
+    def test_empty_transcript(self):
+        self.assertEqual(turn_end_reason(self._r(transcript="")), "empty")
 
 
 if __name__ == "__main__":

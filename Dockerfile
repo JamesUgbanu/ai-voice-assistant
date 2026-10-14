@@ -3,11 +3,15 @@
 # stays small and cacheable; pin versions in pyproject.toml.
 FROM python:3.12-slim-bookworm AS base
 
+# Cap glibc malloc arenas: the service is multithreaded (executor + torch +
+# CTranslate2), and per-thread arenas fragment and inflate idle RSS that is
+# never returned to the OS. Two arenas keeps fragmentation bounded.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     OMP_NUM_THREADS=2 \
-    MKL_NUM_THREADS=2
+    MKL_NUM_THREADS=2 \
+    MALLOC_ARENA_MAX=2
 
 WORKDIR /srv/voice
 
@@ -25,7 +29,8 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
 
 COPY app ./app
 
-RUN useradd --create-home --shell /usr/sbin/nologin voice && \
+RUN getent group voice >/dev/null || groupadd -r voice; \
+    id -u voice >/dev/null 2>&1 || useradd -r -g voice --create-home --shell /usr/sbin/nologin voice && \
     mkdir -p /srv/voice/data /srv/voice/models && \
     chown -R voice:voice /srv/voice
 USER voice
@@ -39,4 +44,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status == 200 else 1)"
 
-CMD ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000", "--workers", "1"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

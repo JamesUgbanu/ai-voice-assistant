@@ -6,6 +6,8 @@ music. Lazy import; deterministic stub for tests.
 """
 from __future__ import annotations
 
+import threading
+
 
 class VadBackend:
     name = "base"
@@ -13,6 +15,21 @@ class VadBackend:
     def speech_probability(self, pcm16_mono_16k: bytes) -> float:
         """Probability [0,1] that the frame contains speech."""
         raise NotImplementedError
+
+
+#: Silero VAD rejects any chunk with sr/len > 31.25, i.e. shorter than 512
+#: samples at 16 kHz ("Input audio chunk is too short").
+MIN_WINDOW = 512
+
+
+def window_pad(num_samples: int, window: int = MIN_WINDOW) -> int:
+    """Number of zero samples to append so `num_samples` is a whole number of
+    `window`-sized chunks. Silero (TorchScript) raises on a short final
+    window, so the tail is padded to a full window before scoring. Pure and
+    unit-tested; zero-padding is silence and never creates false positives."""
+    if window <= 0 or num_samples <= 0:
+        return 0
+    return (-num_samples) % window
 
 
 def max_window_score(num_samples: int, window: int, score_fn) -> float:
@@ -37,6 +54,7 @@ class SileroVadBackend(VadBackend):
         self._source = source
         self._model = None
         self._state = None
+        self._lock = threading.Lock()
 
     def _ensure(self):
         import os
@@ -51,17 +69,19 @@ class SileroVadBackend(VadBackend):
         # direct instantiation working; Settings is the source of truth.
         source = os.environ.get("VOICE_VAD_SOURCE", self._source)
         if self._model is None:
-            if source.startswith("local:"):
-                self._model, utils = torch.hub.load(
-                    repo_or_dir=source[len("local:"):], model="silero_vad",
-                    source="local", force_reload=False, trust_repo=False,
-                )
-            else:
-                self._model, utils = torch.hub.load(
-                    repo_or_dir=source, model="silero_vad", force_reload=False, trust_repo=True
-                )
-            self._reset = utils[0]
-            self._state = None
+            with self._lock:
+                if self._model is None:
+                    if source.startswith("local:"):
+                        self._model, utils = torch.hub.load(
+                            repo_or_dir=source[len("local:"):], model="silero_vad",
+                            source="local", force_reload=False, trust_repo=False,
+                        )
+                    else:
+                        self._model, utils = torch.hub.load(
+                            repo_or_dir=source, model="silero_vad", force_reload=False, trust_repo=True
+                        )
+                    self._reset = utils[0]
+                    self._state = None
         return self._model
 
     def speech_probability(self, pcm16_mono_16k: bytes) -> float:
@@ -72,6 +92,12 @@ class SileroVadBackend(VadBackend):
 
         samples = np.frombuffer(pcm16_mono_16k, dtype=np.int16).astype("float32") / 32768.0
         audio = torch.from_numpy(samples)
+        # Pad the tail to a whole window: Silero raises "Input audio chunk is
+        # too short" on a final window shorter than 512 samples. Without this,
+        # any utterance whose length isn't a multiple of 512 fails the turn.
+        pad = window_pad(audio.numel(), MIN_WINDOW)
+        if pad:
+            audio = torch.cat([audio, torch.zeros(pad, dtype=audio.dtype)])
         # Score the whole utterance as non-overlapping 512-sample windows
         # and take the max: scoring only the tail would miss speech followed
         # by trailing silence (false negatives) and overreact to trailing

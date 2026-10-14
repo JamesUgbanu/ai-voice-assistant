@@ -1,0 +1,16 @@
+# Keep private recordings and local state out of the image build context.
+# The Dockerfile only COPYs pyproject.toml and app/, so these are belt-and-
+# braces against future COPY changes and keep the context small.
+.env
+.git
+.gitignore
+__pycache__/
+*.pyc
+data/
+models/
+voice-reference/
+voices/
+*.wav
+*.mp3
+P2*-REPORT.md
+tests/

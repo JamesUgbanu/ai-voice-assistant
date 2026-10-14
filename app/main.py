@@ -25,7 +25,8 @@ from fastapi.responses import JSONResponse
 from . import auth, rag_client, store
 from .config import Settings
 from .logging_util import configure, event
-from .pipeline import run_turn
+from .pipeline import run_turn, turn_end_reason
+from .greeting import greeting_reply
 from .protocol import (
     is_fatal_error,
     make_envelope,
@@ -34,6 +35,12 @@ from .protocol import (
     validate_envelope,
 )
 from .stt import FasterWhisperBackend, SttConfig, StubSttBackend
+from .transcribe import (
+    DICTATION_SUBJECT_PREFIX,
+    TranscribeError,
+    WindowLimiter,
+    validate_transcribe_audio,
+)
 from .tts import PocketTtsBackend, StubTtsBackend, TtsConfig
 from .turns import TurnState
 from .vad import SileroVadBackend, StubVadBackend
@@ -46,11 +53,30 @@ _db = None
 _models_lock = asyncio.Lock()
 _models: dict = {}
 _metrics: dict[str, int] = {}
+#: Set once the startup warm-up attempt finishes (success or failure). Session
+#: creation waits on it so the first turn never races a cold model load.
+_warm_event = threading.Event()
+_warm_error: str | None = None
 _httpx_client = None
+#: Composer-dictation rate limits (in-process, single worker).
+_transcribe_throttle = WindowLimiter()
+_ticket_throttle = WindowLimiter()
 
 
 def metric(name: str, delta: int = 1) -> None:
     _metrics[name] = _metrics.get(name, 0) + delta
+
+
+def _trim_memory() -> None:
+    """Return freed glibc heap pages to the OS. Inference allocates and frees
+    variable-sized buffers; without trimming, RSS holds that memory after the
+    turn ends. No-op on platforms without glibc (e.g. macOS dev)."""
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 def db():
@@ -115,8 +141,12 @@ async def http_client():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db()  # ensure schema exists before serving
-    event(logger, "voice_startup", models="lazy", db=settings.db_path)
+    event(logger, "voice_startup", models="lazy", db=settings.db_path,
+          tts_mode=settings.tts_mode, tts_ref_configured=bool(settings.tts_voice_ref))
+    # Warm the models in the background so the first turn is not cold.
+    warm_task = asyncio.create_task(warm_models())
     yield
+    warm_task.cancel()
     if _httpx_client is not None:
         try:
             await _httpx_client.aclose()
@@ -126,12 +156,12 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="james-voice-service", version="0.1.0", docs_url=None, redoc_url=None)
+    app = FastAPI(title="james-voice-service", version="0.1.0", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type"],
+        allow_headers=["Content-Type", "X-Voice-Ticket"],
         allow_credentials=True,
         max_age=600,
     )
@@ -143,7 +173,7 @@ def create_app() -> FastAPI:
             db_ok = True
         except Exception:
             db_ok = False
-        return {"status": "ok" if db_ok else "degraded", "db": db_ok}
+        return {"status": "ok" if db_ok else "degraded", "db": db_ok, "warm": _warm_event.is_set()}
 
     @app.get("/metrics")
     async def metrics():
@@ -158,6 +188,9 @@ def create_app() -> FastAPI:
                 body = {}
         except Exception:
             body = {}
+        # Never hand out a session before the models are warm, so the first
+        # turn is not a cold load. Bounded: proceeds after the timeout anyway.
+        await wait_until_warm()
         client_ip = _client_ip(request)
         ip_hash = auth.hash_ip(client_ip, _hmac_secret_salt())
         now = time.time()
@@ -236,6 +269,125 @@ def create_app() -> FastAPI:
             samesite="none" if secure else "lax",
         )
         return response
+
+    @app.post("/v1/transcribe/ticket")
+    async def transcribe_ticket(request: Request):
+        """Mint a short-lived HMAC ticket for composer dictation.
+
+        Browser-usable without any secret: the ticket only proves this origin
+        spoke to us moments ago; abuse is bounded by per-IP windows and the
+        ticket's short TTL. No voice-session/allowance budget is consumed."""
+        await wait_until_warm()
+        now = time.time()
+        now_ms = int(now * 1000)
+        ip_hash = auth.hash_ip(_client_ip(request), _hmac_secret_salt())
+        allowed, retry = _ticket_throttle.allow(
+            f"tt:{ip_hash}", settings.transcribe_ticket_per_minute, 60_000, now_ms
+        )
+        if not allowed:
+            metric("transcribe_ticket_rejected")
+            return JSONResponse(
+                {"error": {"code": "rate_limited", "message": "Too many requests. Try again shortly."}},
+                status_code=429,
+                headers={"Retry-After": str(max(1, retry // 1000))},
+            )
+        visitor_id = request.cookies.get(auth.COOKIE_NAME, "")
+        new_visitor = not auth.is_valid_id(visitor_id)
+        if new_visitor:
+            visitor_id = auth.new_visitor_id()
+        expiry = now + settings.transcribe_ticket_ttl_seconds
+        ticket = auth.issue_ticket(
+            _ticket_secret(), f"{DICTATION_SUBJECT_PREFIX}{visitor_id}", expiry
+        )
+        response = JSONResponse(
+            {"ticket": ticket, "expires_at": int(expiry), "sample_rate": settings.sample_rate}
+        )
+        if new_visitor:
+            secure = request.url.scheme == "https"
+            response.set_cookie(
+                auth.COOKIE_NAME,
+                visitor_id,
+                max_age=365 * 24 * 3600,
+                path="/",
+                httponly=True,
+                secure=secure,
+                samesite="none" if secure else "lax",
+            )
+        return response
+
+    @app.post("/v1/transcribe")
+    async def transcribe(request: Request):
+        """Transcribe one composer recording with the SAME loaded Whisper model
+        used by voice mode. Body: raw PCM16 mono 16 kHz (what the browser worklet
+        produces and faster-whisper expects — no decode/resample step)."""
+        now = time.time()
+        ticket = request.headers.get("x-voice-ticket", "")
+        subject = (
+            auth.verify_ticket(
+                _ticket_secret(), ticket, now=now,
+                max_age_seconds=settings.transcribe_ticket_ttl_seconds,
+            )
+            if ticket
+            else None
+        )
+        if not subject or not subject.startswith(DICTATION_SUBJECT_PREFIX):
+            metric("transcribe_unauthorized")
+            return JSONResponse(
+                {"error": {"code": "unauthorized", "message": "Dictation ticket invalid or expired."}},
+                status_code=401,
+            )
+        ip_hash = auth.hash_ip(_client_ip(request), _hmac_secret_salt())
+        allowed, retry = _transcribe_throttle.allow(
+            f"tr:{ip_hash}", settings.transcribe_per_minute, 60_000, int(now * 1000)
+        )
+        if not allowed:
+            metric("transcribe_rejected")
+            return JSONResponse(
+                {"error": {"code": "rate_limited", "message": "Too many dictation requests. Try again shortly."}},
+                status_code=429,
+                headers={"Retry-After": str(max(1, retry // 1000))},
+            )
+        # Bounded read: never buffer more than one allowed recording.
+        max_bytes = settings.transcribe_max_seconds * settings.sample_rate * 2
+        buf = bytearray()
+        async for chunk in request.stream():
+            buf.extend(chunk)
+            if len(buf) > max_bytes:
+                metric("transcribe_too_large")
+                return JSONResponse(
+                    {"error": {"code": "too_large", "message": "Recording is longer than allowed."}},
+                    status_code=413,
+                )
+        try:
+            pcm = validate_transcribe_audio(bytes(buf), max_bytes=max_bytes)
+        except TranscribeError as exc:
+            status = 413 if exc.code == "too_large" else 400
+            return JSONResponse({"error": {"code": exc.code, "message": exc.message}}, status_code=status)
+        await wait_until_warm()
+        try:
+            models = await get_models()
+            stt, stt_cfg = models["stt"], _stt_config()
+        except Exception:
+            return JSONResponse(
+                {"error": {"code": "server_error", "message": "Try again shortly."}}, status_code=500
+            )
+        t0 = time.time()
+        try:
+            transcript = await asyncio.to_thread(stt.transcribe, pcm, stt_cfg)
+        except Exception as exc:  # noqa: BLE001
+            event(logger, "transcribe_failed", error=type(exc).__name__)
+            return JSONResponse(
+                {"error": {"code": "transcribe_failed", "message": "Could not transcribe that. Please try again."}},
+                status_code=500,
+            )
+        metric("transcribe_ok")
+        event(logger, "dictation_transcribed", ms=int((time.time() - t0) * 1000),
+              no_speech=bool(getattr(transcript, "no_speech", False)),
+              chars=len(transcript.text or ""))
+        await asyncio.to_thread(_trim_memory)
+        return JSONResponse(
+            {"text": transcript.text or "", "no_speech": bool(getattr(transcript, "no_speech", False))}
+        )
 
     @app.websocket("/v1/voice")
     async def voice_socket(websocket: WebSocket):
@@ -327,6 +479,7 @@ async def _handle_socket(websocket: WebSocket) -> None:
     turn_cancel: asyncio.Event | None = None
     turn_task: asyncio.Task | None = None
     audio_buf = bytearray()
+    audio_frames = 0
     last_ping_at = 0.0
     started_at = float(row["started_at"])
     max_seconds = int(row["max_seconds"])
@@ -344,8 +497,15 @@ async def _handle_socket(websocket: WebSocket) -> None:
         return True
 
     async def end_turn_state(reason: str) -> None:
-        nonlocal turn_task, turn_cancel, audio_buf
+        nonlocal turn_task, turn_cancel, audio_buf, audio_frames
         turn_id = state.cancel()
+        # Signal cooperatively first: the RAG stream checks this event and
+        # closes the upstream HTTP request, and the streaming TTS producer
+        # observes it between chunks. The task cancel below is the backstop for
+        # anything mid-await. Interrupting cancels the whole obsolete pipeline
+        # (RAG + TTS generation), not just playback.
+        if turn_cancel is not None:
+            turn_cancel.set()
         if turn_task is not None and not turn_task.done():
             turn_task.cancel()
             try:
@@ -355,7 +515,11 @@ async def _handle_socket(websocket: WebSocket) -> None:
         turn_task = None
         turn_cancel = None
         audio_buf = bytearray()
+        audio_frames = 0
         await send(make_envelope("turn_end", {"reason": reason, "turn_id": turn_id}))
+        # Interrupted/cancelled turns leave inference scratch behind; hand it
+        # back to the OS now rather than holding it as idle RSS.
+        await asyncio.to_thread(_trim_memory)
 
     async def run_utterance(turn_id: str, pcm: bytes) -> None:
         nonlocal turn_cancel, turn_task
@@ -381,6 +545,23 @@ async def _handle_socket(websocket: WebSocket) -> None:
             )
             return out.text
 
+        async def rag_stream(text: str):
+            # Stream the portfolio answer token-by-token so TTS can start on
+            # the first natural segment instead of the full response.
+            client = await http_client()
+            from . import rag_client as rc
+
+            stop_event = turn_cancel
+            async for chunk in rc.iter_answer(
+                client,
+                settings.rag_api_url,
+                settings.rag_service_token,
+                text,
+                timeout_seconds=settings.rag_timeout_seconds,
+                should_stop=(lambda: stop_event.is_set()) if stop_event else None,
+            ):
+                yield chunk
+
         async def emit_frame(pcm_bytes: bytes, final: bool) -> None:
             if not state.is_current(turn_id):
                 return
@@ -401,7 +582,7 @@ async def _handle_socket(websocket: WebSocket) -> None:
             )
 
         try:
-            result, _timings = await run_turn(
+            result, timings = await run_turn(
                 state=state,
                 turn_id=turn_id,
                 audio=pcm,
@@ -411,23 +592,51 @@ async def _handle_socket(websocket: WebSocket) -> None:
                 vad=vad,
                 vad_threshold=0.5,
                 rag_ask=rag_ask,
+                rag_stream=rag_stream,
                 tts=tts,
                 tts_config=tts_config,
                 emit_audio_frame=emit_frame,
+                segmentation=_segmentation_config(),
+                fast_reply=lambda text, obj: greeting_reply(text, getattr(obj, "avg_logprob", None)),
+                on_transcript=lambda text: send(
+                    make_envelope("transcript_final", {"text": text, "turn_id": turn_id})
+                ),
             )
         except asyncio.CancelledError:
             return
-        if result.cancelled or not state.is_current(turn_id):
+        # Stage-by-stage timing for one turn (monotonic durations, no PII).
+        event(
+            logger,
+            "turn_timing",
+            turn=turn_id,
+            stt_ms=timings.stt_ms,
+            rag_ms=timings.rag_ms,
+            tts_first_ms=timings.tts_first_ms,
+            first_audio_ms=timings.first_audio_ms,
+            tts_total_ms=timings.tts_total_ms,
+            total_ms=timings.total_ms,
+            frames=result.audio_frames,
+            fast_path=result.fast_path,
+            cancelled=result.cancelled,
+            error=result.error,
+        )
+        # The turn-end decision comes from the result, never from
+        # state.is_current: a completed turn is already idle, so gating the
+        # completion event on liveness silently swallowed turn_end(complete)
+        # (client stuck 'speaking') and turn_end(error).
+        reason = turn_end_reason(result)
+        if reason is None:
             return
-        if result.error:
-            await send(make_envelope("turn_end", {"reason": result.error, "turn_id": turn_id}))
-            return
-        if not result.transcript:
-            await send(make_envelope("turn_end", {"reason": "empty", "turn_id": turn_id}))
-            return
-        event(logger, "turn_complete", frames=result.audio_frames)
-        await send(make_envelope("turn_end", {"reason": "complete", "turn_id": turn_id}))
+        if reason == "complete":
+            event(logger, "turn_complete", frames=result.audio_frames)
+        elif reason == "empty":
+            pass
+        else:
+            event(logger, "turn_failed", turn=turn_id, reason=reason)
+        await send(make_envelope("turn_end", {"reason": reason, "turn_id": turn_id}))
         turn_task = None
+        # Return inference scratch (TTS/RAG buffers) to the OS after the turn.
+        await asyncio.to_thread(_trim_memory)
 
     await send(make_envelope("session_created", {"session_id": session_id, "max_seconds": max_seconds}))
     await send(make_envelope("listening", {}))
@@ -482,6 +691,7 @@ async def _handle_socket(websocket: WebSocket) -> None:
                     )
                     state.add_audio(len(raw_pcm), max_turn)
                     audio_buf.extend(raw_pcm)
+                    audio_frames += 1
                 except (ValueError, OverflowError) as exc:
                     code = "turn_too_long" if isinstance(exc, OverflowError) else "bad_message"
                     await send(make_envelope("error", {"code": code, "message": str(exc)}))
@@ -493,7 +703,19 @@ async def _handle_socket(websocket: WebSocket) -> None:
                 # is still running, interrupt it, then process the buffered
                 # utterance as the new turn instead of dropping it silently.
                 pcm = bytes(audio_buf)
+                nframes = audio_frames
                 audio_buf = bytearray()
+                audio_frames = 0
+                if not pcm.strip(b"\x00"):
+                    # Stray/duplicate end_utterance carrying no new audio: never
+                    # cancel an in-flight turn for nothing. Proven live: a duplicate
+                    # end_utterance murdered a valid "Hello" turn (turn_end
+                    # "interrupted", then "empty", transcript never delivered).
+                    event(logger, "empty_end_utterance",
+                          turn_active=turn_task is not None and not turn_task.done())
+                    continue
+                event(logger, "utterance_audio", frames=nframes,
+                      bytes=len(pcm), secs=round(len(pcm) / 32000, 2))
                 if turn_task is not None and not turn_task.done():
                     await end_turn_state("interrupted")
                     state.begin_turn()
@@ -536,13 +758,101 @@ async def _handle_socket(websocket: WebSocket) -> None:
 def _stt_config():
     from .stt import SttConfig
 
-    return SttConfig(model=settings.stt_model)
+    return SttConfig(
+        model=settings.stt_model,
+        beam_size=settings.stt_beam_size,
+        cpu_threads=settings.stt_cpu_threads,
+        initial_prompt=settings.stt_initial_prompt,
+        hotwords=settings.stt_hotwords,
+        temperature=settings.stt_temperature,
+        condition_on_previous_text=settings.stt_condition_previous,
+    )
+
+
+def _segmentation_config() -> dict:
+    return {
+        "max_wait_ms": settings.tts_max_wait_ms,
+        "clause_trigger_chars": settings.tts_clause_trigger_chars,
+        "max_chars": settings.tts_max_chars,
+        "min_chars": settings.tts_min_chars,
+    }
+
+
+async def warm_models() -> None:
+    """Load STT/TTS/VAD weights once at startup, off the request path, so the
+    first real turn does not pay the cold model load (the dominant cause of
+    multi-second first turns and the historical outlier). Non-blocking: runs
+    in a worker thread and never affects health or startup."""
+    import time
+
+    try:
+        models = await get_models()
+        stt, tts, vad = models["stt"], models["tts"], models["vad"]
+        stt_cfg, tts_cfg = _stt_config(), _tts_config()
+
+        def _work() -> dict:
+            stamps: dict[str, int | str] = {}
+            t_all = time.time()
+            t = time.time()
+            try:
+                vad.speech_probability(bytes(3200))
+                stamps["vad_ms"] = int((time.time() - t) * 1000)
+            except Exception as exc:  # noqa: BLE001
+                stamps["vad_error"] = type(exc).__name__
+            t = time.time()
+            try:
+                # 1 s of silence loads the CTranslate2 model without a real
+                # transcript to leak.
+                stt.transcribe(bytes(16000 * 2), stt_cfg)
+                stamps["stt_ms"] = int((time.time() - t) * 1000)
+            except Exception as exc:  # noqa: BLE001
+                stamps["stt_error"] = type(exc).__name__
+            t = time.time()
+            try:
+                if hasattr(tts, "preflight"):
+                    tts.preflight(tts_cfg)
+                else:
+                    tts.synthesize_full("Ready.", tts_cfg)
+                stamps["tts_ms"] = int((time.time() - t) * 1000)
+            except Exception as exc:  # noqa: BLE001
+                stamps["tts_error"] = type(exc).__name__
+            stamps["total_ms"] = int((time.time() - t_all) * 1000)
+            return stamps
+
+        stamps = await asyncio.to_thread(_work)
+        event(logger, "models_warm", **stamps)
+    except Exception as exc:  # noqa: BLE001
+        global _warm_error
+        _warm_error = type(exc).__name__
+        event(logger, "models_warm_failed", error=_warm_error)
+    finally:
+        # Readiness reflects "warm-up finished", so a session never waits
+        # forever if warming failed — it just proceeds with lazy loading.
+        _warm_event.set()
+        await asyncio.to_thread(_trim_memory)
+
+
+async def wait_until_warm(timeout: float = 180.0) -> bool:
+    """Wait for the startup warm-up to finish (bounded). Returns True when the
+    models are warm, False on timeout."""
+    if _warm_event.is_set():
+        return True
+    try:
+        await asyncio.wait_for(asyncio.to_thread(_warm_event.wait), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        return False
 
 
 def _tts_config():
     from .tts import TtsConfig
 
-    return TtsConfig(language=settings.tts_language, voice_ref=settings.tts_voice_ref)
+    return TtsConfig(
+        language=settings.tts_language,
+        mode=settings.tts_mode,
+        voice_ref=settings.tts_voice_ref,
+        preset_voice=settings.tts_preset_voice,
+    )
 
 
 app = create_app()

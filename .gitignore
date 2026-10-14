@@ -12,3 +12,9 @@ voices/
 *.wav
 *.mp3
 .DS_Store
+
+# Private voice-reference recordings and generated artifacts (never commit).
+# Only voice-reference/README.md is tracked; see that file for the layout.
+voice-reference/original/
+voice-reference/processed/
+voice-reference/output/
