@@ -427,6 +427,19 @@ def _ticket_secret() -> str:
     return secret
 
 
+def _diag_capture_dir() -> str | None:
+    """Directory for temporary P2Y Whisper-input captures, or None.
+
+    Opt-in via VOICE_DIAG_CAPTURE_DIR (set only in the local-dev overlay).
+    Unset/empty by default: zero capture behavior. Local only — the sidecar
+    holds transcript text and must never be enabled in production.
+    """
+    import os
+
+    directory = os.environ.get("VOICE_DIAG_CAPTURE_DIR", "").strip()
+    return directory or None
+
+
 def _client_ip(request: Request) -> str:
     # Trust model: Caddy overwrites X-Forwarded-For with the true peer IP,
     # so first-entry is correct in production. Direct container access could
@@ -601,6 +614,7 @@ async def _handle_socket(websocket: WebSocket) -> None:
                 on_transcript=lambda text: send(
                     make_envelope("transcript_final", {"text": text, "turn_id": turn_id})
                 ),
+                diag_dir=_diag_capture_dir(),
             )
         except asyncio.CancelledError:
             return
@@ -611,6 +625,7 @@ async def _handle_socket(websocket: WebSocket) -> None:
             turn=turn_id,
             stt_ms=timings.stt_ms,
             rag_ms=timings.rag_ms,
+            rag_total_ms=timings.rag_total_ms,
             tts_first_ms=timings.tts_first_ms,
             first_audio_ms=timings.first_audio_ms,
             tts_total_ms=timings.tts_total_ms,
@@ -707,12 +722,22 @@ async def _handle_socket(websocket: WebSocket) -> None:
                 audio_buf = bytearray()
                 audio_frames = 0
                 if not pcm.strip(b"\x00"):
-                    # Stray/duplicate end_utterance carrying no new audio: never
-                    # cancel an in-flight turn for nothing. Proven live: a duplicate
-                    # end_utterance murdered a valid "Hello" turn (turn_end
-                    # "interrupted", then "empty", transcript never delivered).
-                    event(logger, "empty_end_utterance",
-                          turn_active=turn_task is not None and not turn_task.done())
+                    # Stray/duplicate end_utterance with no new audio. If a
+                    # turn is in flight, protect it and stay silent (its own
+                    # completion will answer). Otherwise acknowledge with an
+                    # empty turn_end so the client never hangs waiting — pure
+                    # silence must still terminate the utterance.
+                    # (Proven live: an all-silence utterance got no reply at
+                    # all and the client waited out its full timeout.)
+                    interrupted = turn_task is not None and not turn_task.done()
+                    event(logger, "empty_end_utterance", turn_active=interrupted)
+                    if interrupted:
+                        continue
+                    try:
+                        state.transition("idle")
+                    except ValueError:
+                        pass
+                    await send(make_envelope("turn_end", {"reason": "empty", "turn_id": None}))
                     continue
                 event(logger, "utterance_audio", frames=nframes,
                       bytes=len(pcm), secs=round(len(pcm) / 32000, 2))
@@ -820,7 +845,9 @@ async def warm_models() -> None:
             return stamps
 
         stamps = await asyncio.to_thread(_work)
-        event(logger, "models_warm", **stamps)
+        # Selected STT model is logged so the running configuration is always
+        # verifiable (e.g. local small.en evaluation vs production base.en).
+        event(logger, "models_warm", stt_model=settings.stt_model, **stamps)
     except Exception as exc:  # noqa: BLE001
         global _warm_error
         _warm_error = type(exc).__name__

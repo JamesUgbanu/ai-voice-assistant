@@ -72,6 +72,60 @@ class RunTurnTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.frames, [])
         self.assertEqual(s.state, "idle")
 
+    async def test_diag_capture_writes_whisper_input(self):
+        import asyncio
+        import json
+        import os
+        import tempfile
+        import wave
+
+        from app.stt import SttConfig
+
+        with tempfile.TemporaryDirectory() as tmp:
+            s, tid = collecting()
+            cancelled = asyncio.Event()
+            result, _ = await run_turn(
+                state=s, turn_id=tid, audio=b"\x10\x00" * 800, cancelled=cancelled,
+                stt=self.stt, stt_config=SttConfig(), vad=self.vad,
+                vad_threshold=0.5, rag_ask=_ok_rag, tts=self.tts,
+                tts_config=self.tts_config, emit_audio_frame=self._emit,
+                diag_dir=tmp,
+            )
+            self.assertEqual(result.transcript, "hello james")
+            names = os.listdir(tmp)
+            wavs = [n for n in names if n.endswith(".wav")]
+            jsons = [n for n in names if n.endswith(".json")]
+            self.assertEqual(len(wavs), 1)
+            self.assertEqual(len(jsons), 1)
+            self.assertEqual(
+                wavs[0][:-4], jsons[0][:-5],
+                "WAV and sidecar share the diagnostic ID",
+            )
+            with wave.open(os.path.join(tmp, wavs[0]), "rb") as fh:
+                self.assertEqual((fh.getnchannels(), fh.getsampwidth(), fh.getframerate()), (1, 2, 16000))
+            with open(os.path.join(tmp, jsons[0])) as fh:
+                sidecar = json.load(fh)
+            self.assertEqual(sidecar["turn_id"], tid)
+            self.assertEqual(sidecar["result"]["transcript"], "hello james")
+
+    async def test_diag_capture_disabled_writes_nothing(self):
+        import asyncio
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "caps")
+            s, tid = collecting()
+            cancelled = asyncio.Event()
+            await run_turn(
+                state=s, turn_id=tid, audio=b"\x10\x00" * 800, cancelled=cancelled,
+                stt=self.stt, stt_config=self.stt_config, vad=self.vad,
+                vad_threshold=0.5, rag_ask=_ok_rag, tts=self.tts,
+                tts_config=self.tts_config, emit_audio_frame=self._emit,
+                diag_dir=None,
+            )
+            self.assertFalse(os.path.exists(target))
+
     async def test_cancel_mid_turn_stops_everything(self):
         s, tid = collecting()
         cancelled = asyncio.Event()

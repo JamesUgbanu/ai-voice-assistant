@@ -13,9 +13,21 @@ services:
       # Authorized reference audio, mounted read-only. NOT baked into the
       # image. Enable clone mode via VOICE_TTS_MODE/VOICE_TTS_VOICE_REF in .env.
       - ./voice-reference/processed:/srv/voice/voice-reference/processed:ro
+      # TEMPORARY P2Y diagnostic captures (WAV+JSON per transcribed turn).
+      # Host dir ./whisper-captures (git-ignored); delete its contents after
+      # the investigation. Local only — never add this mount to production.
+      - ./whisper-captures:/captures
     environment:
       VOICE_PUBLIC_BASE_URL: http://localhost:8000
       # Local browser origin(s). The portfolio dev server runs on :3000;
       # :3001 is kept for a second explicit voice-test instance. Production
       # origins come from VOICE_ALLOWED_ORIGINS in .env, untouched here.
       VOICE_ALLOWED_ORIGINS: http://localhost:3000,http://localhost:3001
+      # TEMPORARY P2Z local evaluation: use small.en instead of the production
+      # default base.en (set in .env / config.py default, both untouched).
+      # Explicit, dev-only (this overlay never runs in production), reversible
+      # by deleting these two lines and recreating the container.
+      VOICE_STT_MODEL: small.en
+      # TEMPORARY P2Y opt-in capture of the exact Whisper input. Unset/empty
+      # disables capture entirely. Local only — never set in production.
+      VOICE_DIAG_CAPTURE_DIR: /captures

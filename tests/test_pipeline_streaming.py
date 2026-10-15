@@ -245,6 +245,28 @@ class IncrementalTurnTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(frames[-1][1] is True)
         self.assertEqual(res.answer_text, "Hi there, good to hear from you.")
 
+    async def test_rag_total_covers_stream_duration(self):
+        """RAG duration must span stream open → close, not just first token:
+        the missing half of the bottleneck breakdown next to rag_ms."""
+        s, tid = collecting()
+        tick = {"t": 0}
+
+        def now_ms():
+            tick["t"] += 100
+            return tick["t"]
+
+        res, tim = await run_turn(
+            state=s, turn_id=tid, audio=b"\x10\x00" * 800, cancelled=asyncio.Event(),
+            stt=self.stt, stt_config=SttConfig(), vad=self.vad, vad_threshold=0.5,
+            rag_ask=lambda q: None,
+            rag_stream=lambda q: stream_of(["Hello world. ", "Second sentence."]),
+            tts=self.tts, tts_config=TtsConfig(),
+            emit_audio_frame=self._emit, now_ms=now_ms,
+        )
+        self.assertIsNone(res.error)
+        self.assertGreater(tim.rag_total_ms, 0)
+        self.assertGreaterEqual(tim.rag_total_ms, tim.rag_ms)
+
     async def test_timings_capture_first_audio_and_total(self):
         s, tid = collecting()
         res, tim = await run_turn(

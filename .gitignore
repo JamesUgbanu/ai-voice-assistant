@@ -18,3 +18,7 @@ voices/
 voice-reference/original/
 voice-reference/processed/
 voice-reference/output/
+
+# Temporary P2Y diagnostic captures (exact Whisper inputs). Local only;
+# delete the directory contents after the investigation.
+whisper-captures/

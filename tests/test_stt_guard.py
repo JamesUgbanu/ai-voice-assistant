@@ -64,6 +64,13 @@ class HallucinationGuardTest(unittest.TestCase):
         self.assertFalse(is_hallucinated_transcript("Hello.", -0.5, [0.1]))
         self.assertTrue(is_hallucinated_transcript("Hello.", -2.0, [0.4]))
 
+    def test_ambiguous_noise_stays_untouched_at_the_boundary(self):
+        # Heavy-noise "Come on." (-0.59/0.21): genuinely ambiguous decoder
+        # output with moderate stats, adjacent to real short speech. The guard
+        # deliberately passes it — tightening to catch this class would eat
+        # legit quiet utterances. Boundary lock against over-tightening.
+        self.assertFalse(is_hallucinated_transcript("Come on.", -0.59, [0.211]))
+
 
 if __name__ == "__main__":
     unittest.main()

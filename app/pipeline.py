@@ -50,6 +50,10 @@ class TurnTimings:
     rag_ms: int = 0
     tts_first_ms: int = 0
     tts_total_ms: int = 0
+    # RAG first-token → last-token (the tail rag_ms misses); when no token
+    # ever arrived, time spent waiting instead, so stalls read nonzero.
+    # Stays 0 only if the RAG section is never entered.
+    rag_total_ms: int = 0
     # End of speech -> first audio frame emitted (the server-side "first
     # audible" proxy; the browser adds decode + scheduling on top).
     first_audio_ms: int = 0
@@ -104,6 +108,10 @@ async def run_turn(
     rag_stream=None,
     segmentation: dict | None = None,
     fast_reply: Callable[[str, Any], str | None] | None = None,
+    # Temporary P2Y diagnostic capture of the exact Whisper input. None (the
+    # default) disables it entirely; a directory path enables WAV+JSON writes
+    # for every transcribed turn. Local diagnostics only — never production.
+    diag_dir: str | None = None,
 ) -> tuple[TurnResult, TurnTimings]:
     """Execute one turn. Pure orchestration; all side effects via callables.
     `emit_audio_frame(pcm_bytes, final)` may be sync or async. `on_transcript`
@@ -140,11 +148,44 @@ async def run_turn(
         return _fail(state, turn_id, timings, "stt_failed")
     timings.stt_ms = clock() - t0
     transcript = (transcript_obj.text or "").strip()
+    diag_id: str | None = None
+    if diag_dir:
+        # Exact bytes just handed to stt.transcribe, plus everything needed
+        # to replay the decision offline. Best-effort: capture must never
+        # fail the turn, so errors are swallowed after one attempt.
+        try:
+            from .diagcapture import write_diag_capture
+
+            cfg = stt_config
+            diag_id = write_diag_capture(
+                diag_dir,
+                audio=audio,
+                turn_id=turn_id,
+                model_config={
+                    "model": getattr(cfg, "model", "?"),
+                    "beam_size": getattr(cfg, "beam_size", None),
+                    "cpu_threads": getattr(cfg, "cpu_threads", None),
+                    "initial_prompt": getattr(cfg, "initial_prompt", ""),
+                    "hotwords": getattr(cfg, "hotwords", ""),
+                    "temperature": getattr(cfg, "temperature", None),
+                    "condition_on_previous_text": getattr(
+                        cfg, "condition_on_previous_text", None
+                    ),
+                },
+                vad_prob=speech_prob,
+                vad_threshold=vad_threshold,
+                transcript=transcript,
+                avg_logprob=getattr(transcript_obj, "avg_logprob", None),
+                no_speech=bool(getattr(transcript_obj, "no_speech", False)),
+                stt_ms=timings.stt_ms,
+            )
+        except Exception:
+            diag_id = None
     event(logger, "turn_stt", turn=turn_id, vad_prob=round(float(speech_prob), 3),
           audio_secs=round(len(audio) / 32000, 2), chars=len(transcript),
           logprob=getattr(transcript_obj, "avg_logprob", None),
           no_speech=bool(getattr(transcript_obj, "no_speech", False)),
-          ms=timings.stt_ms)
+          ms=timings.stt_ms, diag_id=diag_id)
     if not transcript or getattr(transcript_obj, "no_speech", False):
         state.transition("idle")
         return TurnResult(turn_id, "", "", 0), timings
@@ -259,6 +300,7 @@ async def run_turn(
         ait = (_static_stream(fast_text) if fast_text else rag_stream(transcript)).__aiter__()
         fast_path = fast_text is not None
         pending: "asyncio.Future | None" = None
+        t_last_token: int | None = None
         try:
             while True:
                 if pending is None:
@@ -284,6 +326,7 @@ async def run_turn(
                     pending = None
                     raise
                 pending = None
+                t_last_token = clock()
                 if first_chunk:
                     timings.rag_ms = clock() - t_rag
                     first_chunk = False
@@ -324,6 +367,12 @@ async def run_turn(
         finally:
             if pending is not None and not pending.done():
                 pending.cancel()
+            # RAG first-token → last-token on every path; when no token ever
+            # arrived (hung/failed stream), fall back to time spent waiting so
+            # stalls are visible instead of zero.
+            timings.rag_total_ms = (
+                t_last_token - t_rag if t_last_token is not None else clock() - t_rag
+            )
         timings.tts_total_ms = clock() - t_tts
         timings.total_ms = clock() - t0
         answer_text = "".join(answer_parts).strip()[:max_answer_chars]
