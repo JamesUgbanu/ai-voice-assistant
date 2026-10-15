@@ -56,6 +56,9 @@ class RunTurnTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.frames and self.frames[-1][1] is True)
         self.assertEqual(s.state, "idle")
         self.assertGreaterEqual(timings.stt_ms, 0)
+        # Exactly one transcription per turn: duplicates would double billed
+        # latency on the slowest stage for zero benefit.
+        self.assertEqual(len(self.stt.calls), 1)
 
     async def test_silence_never_reaches_stt_or_rag(self):
         calls = []
