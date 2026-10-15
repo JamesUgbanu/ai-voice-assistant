@@ -28,6 +28,10 @@ services:
       # Explicit, dev-only (this overlay never runs in production), reversible
       # by deleting these two lines and recreating the container.
       VOICE_STT_MODEL: small.en
+      # Per-segment TTS emission diagnostics (app/pipeline.py). Opt-in: set
+      # VOICE_TTS_DIAG: "1" below to log per-segment frame/audio/synth/put
+      # timings locally (metadata only — no audio or text). Off by default.
+      # VOICE_TTS_DIAG: "1"
       # TEMPORARY P2Y opt-in capture of the exact Whisper input. Unset/empty
       # disables capture entirely. Local only — never set in production.
       VOICE_DIAG_CAPTURE_DIR: /captures

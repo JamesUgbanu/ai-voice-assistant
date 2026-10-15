@@ -238,6 +238,15 @@ async def run_turn(
                 state.transition("speaking")
             if t_first_synth is None:
                 t_first_synth = clock()
+            # TEMPORARY TTS emission diagnostic (VOICE_TTS_DIAG=1): measures
+            # per-segment synthesis span and frame count so inter-segment gaps
+            # (segmentation/RAG waits) can be separated from intra-segment
+            # synthesis speed. No audio or text content is logged.
+            import os as _os
+
+            _diag = _os.environ.get("VOICE_TTS_DIAG", "").strip() == "1"
+            _seg_t0 = clock()
+            _seg_frames = 0
             # Stream TTS chunks as they are decoded so first audio arrives in
             # a fraction of a second instead of after the whole segment is
             # synthesized. `stop` lets barge-in abort mid-generation. The queue
@@ -254,12 +263,23 @@ async def run_turn(
                 except Exception:
                     pass  # loop closing / consumer gone
 
+            _prod = {"synth_ms": 0, "put_ms": 0}
+
             def produce() -> None:
                 try:
-                    for chunk in tts.synthesize_stream(segment, tts_config, stop=stop):
+                    it = tts.synthesize_stream(segment, tts_config, stop=stop)
+                    while True:
+                        _s = clock()
+                        try:
+                            chunk = next(it)
+                        except StopIteration:
+                            break
+                        _prod["synth_ms"] += clock() - _s
                         if stop.is_set():
                             break
+                        _p = clock()
                         put_blocking(chunk)
+                        _prod["put_ms"] += clock() - _p
                 except BaseException as exc:  # surfaced to the consumer
                     put_blocking(exc)
                 finally:
@@ -283,6 +303,7 @@ async def run_turn(
                     if timings.first_audio_ms == 0:
                         timings.first_audio_ms = clock() - t0
                     frames += 1
+                    _seg_frames += 1
                     res = emit_audio_frame(item, False)
                     if asyncio.iscoroutine(res):
                         await res
@@ -296,6 +317,18 @@ async def run_turn(
                 except asyncio.QueueEmpty:
                     pass
                 await producer
+                if _diag:
+                    event(
+                        logger,
+                        "tts_segment",
+                        turn=turn_id,
+                        chars=len(segment),
+                        frames=_seg_frames,
+                        audio_ms=_seg_frames * 80,
+                        span_ms=clock() - _seg_t0,
+                        synth_ms=_prod["synth_ms"],
+                        put_ms=_prod["put_ms"],
+                    )
 
         ait = (_static_stream(fast_text) if fast_text else rag_stream(transcript)).__aiter__()
         fast_path = fast_text is not None
