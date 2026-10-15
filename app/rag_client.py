@@ -124,9 +124,11 @@ def parse_sse_events(body: str) -> dict:
     return {"answer": "".join(answer_parts), "route": route, "cached": cached, "sources": sources, "error": error}
 
 
-def build_rag_body(question: str, history: list | None = None) -> dict:
+def build_rag_body(question: str, history: list | None = None, mode: str | None = None) -> dict:
     """Request payload honoring the portfolio schema (question 3..500 chars,
-    history capped at 6 turns). Raises RagError on invalid input."""
+    history capped at 6 turns). `mode="voice"` asks the portfolio for a
+    concise spoken answer and isolates its cache; omitted keeps website
+    behavior. Raises RagError on invalid input."""
     q = (question or "").strip()
     if len(q) < 3:
         raise RagError("bad_question", "question is too short")
@@ -138,7 +140,10 @@ def build_rag_body(question: str, history: list | None = None) -> dict:
         ta = str(turn.get("answer", ""))[:2000]
         if tq.strip() and ta.strip():
             clean_history.append({"question": tq, "answer": ta})
-    return {"question": q[:500], "history": clean_history, "debug": False}
+    body = {"question": q[:500], "history": clean_history, "debug": False}
+    if mode:
+        body["mode"] = mode
+    return body
 
 
 async def fetch_answer(
@@ -191,6 +196,7 @@ async def iter_answer(
     timeout_seconds: float = 25.0,
     max_answer_chars: int = 4000,
     should_stop=None,
+    mode: str | None = None,
 ):
     """Stream answer text from the portfolio RAG as it arrives.
 
@@ -205,7 +211,7 @@ async def iter_answer(
     yields fabricated text."""
     if not base_url or not service_token:
         raise RagError("not_configured", "RAG endpoint or service token missing")
-    body = build_rag_body(question, history)
+    body = build_rag_body(question, history, mode)
 
     async def stopped() -> bool:
         if should_stop is None:

@@ -79,6 +79,15 @@ class BuildBodyTest(unittest.TestCase):
                 build_rag_body(bad)
             self.assertEqual(ctx.exception.code, "bad_question")
 
+    def test_voice_mode_is_forwarded_only_when_set(self):
+        # Voice turns request concise spoken answers via the existing API.
+        body = build_rag_body("What has James built with AWS?", mode="voice")
+        self.assertEqual(body["mode"], "voice")
+        # Website/default callers are byte-identical to before: no mode key.
+        self.assertNotIn("mode", build_rag_body("What has James built with AWS?"))
+        self.assertNotIn("mode", build_rag_body("hello there", mode=None))
+        self.assertFalse(body["debug"])
+
 
 class FetchAnswerTest(unittest.IsolatedAsyncioTestCase):
     async def test_success_and_auth_shape(self):

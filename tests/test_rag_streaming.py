@@ -89,6 +89,15 @@ class IterAnswerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chunks, ["Alpha ", "runs on AWS."])
         self.assertEqual(client.calls[0]["headers"], {"Authorization": "Bearer tok"})
 
+    async def test_voice_mode_reaches_the_request_body(self):
+        client = FakeStreamClient(FakeStreamResponse(200, [sse(("token", '{"text":"Hi."}'))]))
+        await collect(iter_answer(client, "https://rag", "t", "What runs on AWS?", mode="voice"))
+        self.assertEqual(client.calls[0]["json"]["mode"], "voice")
+        # Default callers send no mode key (website behavior preserved).
+        client2 = FakeStreamClient(FakeStreamResponse(200, [sse(("token", '{"text":"Hi."}'))]))
+        await collect(iter_answer(client2, "https://rag", "t", "What runs on AWS?"))
+        self.assertNotIn("mode", client2.calls[0]["json"])
+
     async def test_error_event_raises_rag_error(self):
         client = FakeStreamClient(FakeStreamResponse(200, [sse(("error", '{"message":"boom"}'))]))
         with self.assertRaises(RagError) as ctx:

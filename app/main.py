@@ -572,6 +572,7 @@ async def _handle_socket(websocket: WebSocket) -> None:
                 text,
                 timeout_seconds=settings.rag_timeout_seconds,
                 should_stop=(lambda: stop_event.is_set()) if stop_event else None,
+                mode="voice",
             ):
                 yield chunk
 
