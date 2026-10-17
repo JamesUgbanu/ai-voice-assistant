@@ -16,6 +16,9 @@ Capabilities (all verified by the unit suite plus live browser/WS probes):
 
 - Voice calls: mic → VAD → faster-whisper `base.en` → portfolio RAG → Pocket
   TTS → streamed PCM16 playback, with per-turn cancellation.
+- Live transcription while speaking: rolling-window partials (`transcript_partial`)
+  stream into the UI before the utterance ends, then the authoritative
+  `transcript_final` replaces them (see §10a and `docs/STREAMING-STT-REPORT.md`).
 - Barge-in: sustained speech during playback stops the answer (client energy
   detector + server turn cancel), then the interruption is captured as the
   next turn. A manual Interrupt button does the same.
@@ -27,8 +30,10 @@ Capabilities (all verified by the unit suite plus live browser/WS probes):
   session per visitor, per-IP attempt/rate budgets, bounded audio per turn.
 
 Limitations: answer speed follows the remote RAG (LLM) latency; recognition
-follows microphone quality (see Troubleshooting); the 1 CPU / 2 GB target is
-met by reusing one loaded model per backend with serialized inference.
+follows microphone quality (see Troubleshooting). The production target is a
+**4 GB x86-64 Hetzner host**; the measured x86-64 floor is ~1.3 GiB with one
+loaded model per backend and serialized inference (evidence and the live
+verification checklist are in `deploy/README.md`).
 
 ## 2. Architecture
 
@@ -43,6 +48,9 @@ Browser mic ──WS/PCM16 16 kHz──▶ voice server ──HTTPS/SSE──▶
 
 - Turn ids correlate STT → RAG → TTS → playback end to end; late frames from a
   superseded turn are discarded, never played.
+- While collecting, the growing audio is also fed to the incremental path
+  (`partial_stt.py`), which emits replaceable `transcript_partial` events; the
+  turn's single authoritative decode still produces `transcript_final`.
 - `interrupt` (button or voice-triggered) cancels the in-flight turn task,
   which closes the upstream RAG stream and stops the TTS producer — the whole
   obsolete pipeline, not just playback.
@@ -64,6 +72,7 @@ app/
   store.py           SQLite sessions/attempts/usage, transactional (stdlib)
   turns.py           Turn state machine + sentence splitter (stdlib)
   pipeline.py        STT→VAD→RAG→TTS orchestration, cancellation, timings
+  partial_stt.py     Rolling-window incremental STT (partials) + exact reuse
   segmentation.py    Bounded RAG-token → speakable-segment buffer (stdlib)
   stt.py             faster-whisper adapter (lazy) + hallucination guard + stub
   tts.py             Pocket TTS adapter, preset/clone + stub
@@ -83,7 +92,11 @@ Caddyfile            TLS for voice.jamesugbanu.com; proxies only
                      /v1/sessions, /v1/voice, /healthz (`/metrics` stays internal)
 PROTOCOL.md          Full browser↔server protocol reference
 INTEGRATION.md       Verified portfolio RAG contract + examples
-DEPLOY.md            Host prep, secrets, firewall, update/rollback procedures
+DEPLOY.md            Legacy long-lived-Compose runbook (not the scheduled path)
+deploy/README.md     Authoritative production runbook (release, SSM, IPv4, TLS)
+deploy/cloud-init.yaml  Bootstrap template (also bundled into the Lambda)
+deploy/cost-estimate.py  Hetzner 195 h/month budget calculator
+scripts/release.sh   Build/push the private linux/amd64 image; print digest
 docs/                Phase investigation reports (P2A–P2T): measurements and
                      calibration evidence referenced by code comments
 voice-reference/     Private recordings (Git-ignored) + tracked README
@@ -104,11 +117,15 @@ voice-reference/     Private recordings (Git-ignored) + tracked README
 
 ```bash
 cp .env.example .env   # then set the three required secrets (see §6)
-python3 -m unittest discover -s tests        # 162 tests, stdlib only, ~5 s
-docker compose up -d --build                 # build + start voice + Caddy
+python3 -m unittest discover -s tests        # 247 tests (5 skipped), stdlib only
+docker compose up -d --build                 # local/dev: voice + Caddy + host reference
 docker compose ps                            # voice healthy, caddy running
-curl -fsS http://127.0.0.1:8000/healthz      # {"status":"ok","db":true,"warm":true}
+curl -fsS http://127.0.0.1:8000/healthz      # db/warm true; tts reports the resolved mode
 ```
+
+The Compose path mounts a host reference and is for local development only.
+Production pulls the private image with the reference baked in (Option A); use
+`deploy/README.md`, not this Compose file.
 
 First boot downloads weights (several minutes); `/v1/sessions` waits for
 warm-up before answering. Static check without dependencies:
@@ -132,11 +149,16 @@ no default and are required. Never commit real values (`.env` is Git-ignored).
 | `VOICE_STT_HOTWORDS` | no | empty | Extra hotwords (needs a faster-whisper with hotword support) |
 | `VOICE_STT_TEMPERATURE` | no | `0.0` | Deterministic decoding; higher risks hallucinations |
 | `VOICE_STT_CONDITION_PREVIOUS` | no | `0` | Keep `0`: turns are independent utterances |
+| `VOICE_STT_STREAMING` | no | `1` | `0` disables incremental partials (rollback switch) |
+| `VOICE_STT_PARTIAL_INTERVAL_MS` | no | `900` | Debounce between partial decodes |
+| `VOICE_STT_PARTIAL_MIN_AUDIO_MS` | no | `700` | Minimum audio before/growth between partials |
+| `VOICE_STT_PARTIAL_MAX_AUDIO_SECONDS` | no | `15` | Stop new partials past this window (cost bound) |
 | `VOICE_TTS_MODE` | no | `preset` | `preset` (built-in voice) or `clone` (authorized reference) |
 | `VOICE_TTS_PRESET_VOICE` | no | `alba` | Built-in voice in preset mode |
 | `VOICE_TTS_VOICE_REF` | clone only | empty | In-container path to prepared reference (mounted read-only) |
 | `VOICE_TTS_LANGUAGE` | no | `english` | TTS language |
 | `VOICE_TTS_MAX_WAIT_MS` | no | `1200` | Max wait for a natural segment boundary before speaking partial text |
+| `VOICE_TTS_FIRST_MAX_WAIT_MS` | no | `600` | Shorter wait before the FIRST segment only, so speech starts sooner |
 | `VOICE_TTS_CLAUSE_TRIGGER_CHARS` | no | `80` | Clause fallback length |
 | `VOICE_TTS_MAX_CHARS` / `VOICE_TTS_MIN_CHARS` | no | `400` / `12` | Segment size bounds |
 | `VOICE_VAD_SOURCE` | no | `snakers4/silero-vad` | `local:/path` vendors it for reproducible deploys |
@@ -158,7 +180,10 @@ no default and are required. Never commit real values (`.env` is Git-ignored).
 | `VOICE_ALLOWED_ORIGINS` | no | portfolio origin | Explicit browser origins (no wildcards) |
 | `HF_TOKEN` | clone only | empty | Hugging Face token for gated Pocket TTS weights |
 | `VOICE_USE_STUBS` | no | `0` | `1` = stub STT/TTS/VAD for offline runs (never production) |
-| `VOICE_USE_STUBS` | no | `0` | `1` = stub STT/TTS/VAD for offline runs (never production) |
+
+Production provisioning sets `VOICE_TTS_MODE=clone` and the baked reference
+path; clone readiness fails closed if `tts.cloning_active` is not true. Never
+set `VOICE_USE_STUBS=1` in production.
 
 ## 7. Local development
 
@@ -221,10 +246,40 @@ fiction). Licenses: faster-whisper/CTranslate2 MIT; Pocket TTS MIT code with
   closer to the mic and repeat. "Voice hit a snag" means a pipeline failure;
   retry or switch to text.
 
+## 10a. Incremental transcription (live partials)
+
+While the user is speaking, the server re-decodes the audio accumulated so
+far on a debounce and emits `transcript_partial`; the UI shows the evolving
+text, replacing each hypothesis rather than appending. On `end_utterance` the
+authoritative `transcript_final` is produced and only that is sent to RAG.
+
+The decoder (faster-whisper) is **batch**, so this is approximate streaming,
+not native incremental decoding — stated plainly:
+
+- Each partial re-decodes the **whole utterance window so far** (never a
+  suffix), so hypotheses are whole-sentence and nothing is stitched from
+  overlapping windows (the duplicate/dropped-word failure mode). Cost grows
+  with utterance length, so new partials stop once the window exceeds
+  `VOICE_STT_PARTIAL_MAX_AUDIO_SECONDS` (the final decode still uses
+  everything).
+- The final transcript is always **one whole-utterance decode**. When the
+  last partial happened to cover exactly that buffer (the client's ~900 ms
+  silence endpoint leaves a window for this), the identical decode is reused
+  so the final is immediate; otherwise the normal decode runs. Reuse is by
+  exact byte length, never a suffix, so trailing words cannot be clipped.
+- Partials are single-flight per connection and gated to one decode per
+  process across sessions — a slow decode applies backpressure (skips, never
+  queues), so audio cannot pile up. Failures are recoverable and never abort
+  the turn.
+- Rollback: `VOICE_STT_STREAMING=0` disables partials and reuse entirely;
+  behavior returns to the pre-streaming path (final latency unchanged from
+  before). See `docs/STREAMING-STT-REPORT.md` for root cause, trade-offs,
+  measurements, and revert steps.
+
 ## 11. Testing and validation
 
 ```bash
-python3 -m unittest discover -s tests        # 162 tests, stdlib only (~5 s)
+python3 -m unittest discover -s tests        # 247 tests (5 skipped), stdlib only
 python3 -m unittest tests.test_stt_guard -v  # hallucination-guard contract
 python3 -m py_compile app/*.py tests/*.py    # static check (no deps)
 ```
@@ -245,30 +300,47 @@ python3 -m py_compile app/*.py tests/*.py    # static check (no deps)
 
 ## 12. Deployment
 
-Production shape is `docker-compose.yml` + `Caddyfile` on a single host:
+Production is a disposable Hetzner x86-64 (4 GB target) server provisioned by
+AWS Lambda + EventBridge Scheduler and booted from a **pinned private GHCR
+image**. The image bakes the authorized reference (Option A), so the host never
+receives it and no host bind mount may shadow it.
 
-```bash
-docker compose up -d --build          # build voice image, (re)create services
-docker compose ps                     # voice healthy, caddy running
-curl -fsS http://127.0.0.1:8000/healthz
-curl -fsS https://voice.jamesugbanu.com/healthz
-docker compose logs -f voice          # structured JSON, secrets redacted
-```
+The authoritative runbook is `deploy/README.md` (release, GHCR, SSM secrets,
+retained IPv4, Terraform, DNS/TLS, live checks). Scheduler detail lives in
+`../terraform-voice-scheduler/DEPLOY.md`. Operating hours are changed with
+`../terraform-voice-scheduler/scripts/set-voice-hours.sh show|plan|apply`; it
+preserves the enabled/disabled state and never provisions a server.
 
-- DNS for `voice.jamesugbanu.com` must point at the host **before** first boot
-  (ACME challenge), firewall 80/443 + SSH only (see DEPLOY.md).
+High-level flow:
+
+1. Publish `ghcr.io/jamesugbanu/james-voice-service:<immutable version>` as a
+   private `linux/amd64` package and record the registry digest.
+2. Create the seven SSM SecureStrings in `eu-west-2` (RAG bearer, HMAC, IP
+   salt, HF token, Hetzner token, read-only GHCR user/token).
+3. Allocate the retained Hetzner Primary IPv4 outside Terraform; set
+   `primary_ip_id`.
+4. `terraform apply` creates the Lambda/schedules only; schedules stay
+   disabled until a manual provision/teardown has been verified.
+5. Point `voice.jamesugbanu.com` at the retained IP and complete TLS.
+6. Invoke `provision`; the host pulls the pinned digest, pre-downloads models,
+   starts the container, and `/healthz` must report `db=true`, `warm=true`, and
+   `tts.cloning_active=true` in clone mode.
+
+`db` in `/healthz` is the existing SQLite session/quota store, **not** an added
+database. The Lambda treats `/healthz` as the readiness gate and fails closed on
+a missing reference or inactive cloning.
+
+Legacy `docker-compose.yml` + `Caddyfile` remain for local/dev and manual hosts;
+`DEPLOY.md` is the older long-lived-Compose guide and is stale for the scheduled
+lifecycle. Use `deploy/README.md` for production.
+
 - Caddy proxies **only** `/v1/sessions`, `/v1/voice`, `/healthz`; `/metrics`
-  stays reachable inside the compose network, not the internet.
-- Persistence: `voice-data` (SQLite) and `voice-models` (weights) volumes
-  survive recreates; audio is never written to disk.
-- Code changes require image rebuild + recreate (code is baked in; a bare
-  restart is not enough). Rollback: `docker compose up -d` against the
-  previous image tag (retag before upgrading if you need one-command revert).
-- Resource envelope in compose is the dev-planning budget (`cpus: 2.0`,
-  `mem_limit: 10g`); the production target is 1 CPU / 2 GB — re-measure
-  (§8 floor ≈ 1.3 GB) and tighten these caps when deploying there. The 2 GB
-  host is **not approved for production traffic** — see DEPLOY.md for the
-  verdict, the strict ≥2 GB-headroom gate, and the evidence required.
+  stays internal.
+- The current bootstrap publishes the API on loopback only and has **no TLS
+  proxy**. Do not provision until the TLS decision in `deploy/README.md` is
+  approved and implemented.
+- Rollback: pin the previous immutable version or digest and re-provision;
+  never use `latest`/`stable` in production.
 
 ## 13. Troubleshooting
 
@@ -291,16 +363,23 @@ docker compose logs -f voice          # structured JSON, secrets redacted
 
 ## 14. Security and cost controls
 
-- Secrets live only in `.env` (Git-ignored, Docker-ignored, never logged):
-  RAG token, HMAC secret, IP salt, `HF_TOKEN`. Rotate by editing `.env` and
-  recreating the container.
+- Secrets live only in `.env` locally; production values live in SSM
+  `SecureString` and are rendered into root-only `/etc/voice/runtime.env` at
+  boot. The rendered cloud-init user-data is visible to the Hetzner account and
+  instance root, so treat it as sensitive. Never commit or log secrets.
 - Tickets are short-lived HMACs (120 s session, 300 s dictation, scoped
   `dict:` subject); no jwt library, no lookup, constant-time compare.
 - Abuse surface is budgeted: attempt windows, per-IP transcribe limits,
   bounded frames/turns/messages, 60 s max turn audio, single worker.
 - Container runs as non-root `voice`; no wildcard CORS origins; missing
   `Origin` (non-browser) is accepted by convention; `/metrics` is
-  counters-only and not publicly proxied.
+  counters-only and is never publicly proxied (the production bootstrap also
+  keeps the app loopback-only).
+- **Option A biometric privacy:** the authorized reference is baked into the
+  private image. Anyone with pull access can extract and reuse it. Keep the
+  package private, issue read-only pull credentials to the server, and never
+  mount or log the file. Clone readiness fails closed if the reference is absent
+  or `cloning_active` is false.
 - Cost: self-hosted CPU inference (no per-call STT/TTS fees); LLM spend, if
   any, lives on the portfolio side. Model downloads are one-time (~5 GB).
 
@@ -317,11 +396,22 @@ Confirmed (measured, not aspirational):
   recommended).
 - Browser-hardware verification (accent accuracy, AEC, audibility on device)
   requires manual runs; synthetic probes do not transfer.
-- No dependency pins yet (`uv.lock` pending hardware validation); ARM target
-  throughput unmeasured; `DEPLOY.md` still names the original Oracle-ARM plan
-  while the current target is a 1 CPU / 2 GB host — reconcile before release.
+- No dependency pins yet (`uv.lock` pending hardware validation). The
+  production target is a 4 GB x86-64 host; ARM throughput is unmeasured. Root
+  `DEPLOY.md` is the legacy long-lived-Compose guide; `deploy/README.md` is
+  authoritative for the scheduled lifecycle.
+- TLS must survive daily server deletion. Automatic ACME would reissue the same
+  certificate on every provision (~7/week, above Let's Encrypt's
+  duplicate-certificate limit). The TLS persistence decision is documented in
+  `deploy/README.md` but is **not yet implemented**; HTTPS is not production
+  ready until it is.
 - Nigerian-English/Pidgin/Yoruba accuracy is **not** claimed as validated;
   proper-noun biasing via `initial_prompt` is measured on file audio only.
+- Incremental partials are **approximate** (whole-window re-decode, not native
+  streaming): each partial costs CPU proportional to the audio so far, updates
+  pause past `VOICE_STT_PARTIAL_MAX_AUDIO_SECONDS` (15 s default), and partial
+  text may differ slightly from the final decode. They improve perceived
+  latency only; the final transcript and RAG path are unchanged.
 
 Remove `VOICE_SAVE_TURNS_DIR`-style local diagnostics (none present) and any
 future `?voice-diag`-style client flags before release builds.

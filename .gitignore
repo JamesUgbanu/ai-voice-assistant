@@ -18,7 +18,10 @@ voices/
 voice-reference/original/
 voice-reference/processed/
 voice-reference/output/
+# Option A: authorized reference staged for the PRIVATE image build only.
+deploy/reference/
 
 # Temporary P2Y diagnostic captures (exact Whisper inputs). Local only;
 # delete the directory contents after the investigation.
 whisper-captures/
+ssh/

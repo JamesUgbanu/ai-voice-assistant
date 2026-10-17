@@ -1,0 +1,99 @@
+#cloud-config
+# Voice-service bootstrap (Hetzner user_data). double-underscore tokens are substituted by
+# the provisioning Lambda from SSM SecureString values at server-create time.
+# This file is a TEMPLATE: never commit a rendered copy (it contains secrets).
+# user_data is readable by instance root and the Hetzner account only.
+#
+# Flow: install Docker -> write runtime env -> Cloudflare Tunnel credentials/config ->
+# GHCR login+pull pinned image -> pre-download models -> start the app loopback-only ->
+# start cloudflared (outbound-only) -> poll a REAL readiness check -> READY or fail closed.
+# Option A: the authorized voice reference is baked into the private image at
+# /srv/voice/voice-reference/processed/voice-ref.wav; the host never receives it.
+# No inbound 80/443 and no TLS certificate: Cloudflare terminates public TLS.
+package_update: true
+package_upgrade: false
+packages:
+  - docker.io
+  - curl
+  - ca-certificates
+  - ufw
+
+bootcmd:
+  - [ mkdir, -p, /etc/voice, /etc/cloudflared, /opt/voice, /srv/voice/data, /srv/voice/models, /var/lib/voice ]
+
+write_files:
+  - path: /etc/voice/runtime.env
+    permissions: '0600'
+    owner: root:root
+    content: |
+      # RAG (portfolio) — voice service stays a remote client of the secured API.
+      VOICE_RAG_API_URL=__RAG_URL__
+      VOICE_RAG_SERVICE_TOKEN=__RAG_TOKEN__
+      VOICE_HMAC_SECRET=__HMAC_SECRET__
+      VOICE_IP_SALT=__IP_SALT__
+      VOICE_PUBLIC_BASE_URL=__PUBLIC_BASE_URL__
+      VOICE_ALLOWED_ORIGINS=__ALLOWED_ORIGINS__
+      # TTS: clone needs the authorized reference; preset needs none.
+      VOICE_TTS_MODE=__TTS_MODE__
+      VOICE_TTS_VOICE_REF=__TTS_VOICE_REF__
+      HF_TOKEN=__HF_TOKEN__
+      # Persist model caches on the named volume, outside the image layer.
+      VOICE_DB_PATH=/srv/voice/data/voice.sqlite3
+      HF_HOME=/srv/voice/models
+      XDG_CACHE_HOME=/srv/voice/models
+      TORCH_HOME=/srv/voice/models/torch
+      VOICE_STT_MODEL=__STT_MODEL__
+      VOICE_VAD_SOURCE=__VAD_SOURCE__
+  - path: /opt/voice/prewarm.py
+    permissions: '0644'
+    content: |
+      # Pre-download STT/TTS/VAD weights into the mounted cache, then fail closed.
+      from faster_whisper import WhisperModel
+      WhisperModel("__STT_MODEL__", device="cpu", compute_type="int8")
+      from pocket_tts import TTSModel
+      TTSModel.load_model()
+      import torch
+      torch.hub.load("__VAD_SOURCE__", model="silero_vad", trust_repo=True)
+      print("MODELS_OK")
+  - path: /etc/cloudflared/credentials.json
+    permissions: '0400'
+    owner: root:root
+    content: |
+      __CLOUDFLARED_CREDENTIALS__
+  - path: /etc/cloudflared/config.yml
+    permissions: '0644'
+    owner: root:root
+    content: |
+      tunnel: __CLOUDFLARED_TUNNEL_ID__
+      credentials-file: /etc/cloudflared/credentials.json
+      no-autoupdate: true
+      ingress:
+        - hostname: voice.jamesugbanu.com
+          path: "^/(v1/sessions|v1/transcribe|v1/transcribe/ticket|v1/voice|healthz)$"
+          service: http://voice:8000
+        - hostname: voice.jamesugbanu.com
+          service: http_status:404
+        - service: http_status:404
+
+runcmd:
+  - [ systemctl, enable, --now, docker ]
+  - [ mkdir, -p, /srv/voice/data, /srv/voice/models, /var/lib/voice ]
+  - [ chown, -R, 65532:65532, /etc/cloudflared ]
+  - [ chmod, '0400', /etc/cloudflared/credentials.json ]
+  - [ ufw, allow, 22/tcp ]
+  - [ ufw, --force, enable ]
+  # Pull the pinned (immutable) image with a read-only GHCR token, then drop it.
+  - [ sh, -c, "printf '%s' '__GHCR_TOKEN__' | docker login ghcr.io -u '__GHCR_USER__' --password-stdin" ]
+  - [ docker, pull, __IMAGE__ ]
+  - [ docker, logout, ghcr.io ]
+  # Model pre-download into the persistent named volume (exact app code path).
+  - [ docker, run, --rm, -e, HF_HOME=/srv/voice/models, -e, XDG_CACHE_HOME=/srv/voice/models, -e, TORCH_HOME=/srv/voice/models/torch, -e, HF_TOKEN=__HF_TOKEN__, -v, voice-models:/srv/voice/models, -v, /opt/voice:/opt/voice:ro, --entrypoint, python, __IMAGE__, /opt/voice/prewarm.py ]
+  # App is internal-only; loopback publish is for the local readiness probe.
+  - [ sh, -c, "docker network create voice-net >/dev/null 2>&1 || true" ]
+  - [ docker, run, -d, --restart, unless-stopped, --name, voice, --network, voice-net, --env-file, /etc/voice/runtime.env, -p, "127.0.0.1:8000:8000", -v, voice-data:/srv/voice/data, -v, voice-models:/srv/voice/models, __IMAGE__ ]
+  # Outbound-only tunnel to Cloudflare; no inbound listener on the host.
+  - [ docker, run, -d, --restart, unless-stopped, --name, cloudflared, --network, voice-net, -v, /etc/cloudflared:/etc/cloudflared:ro, cloudflare/cloudflared:2026.10.1, tunnel, --config, /etc/cloudflared/config.yml, run ]
+  # REAL readiness: /healthz must report db+warm and (clone) cloning_active.
+  - [ sh, -c, "for i in $(seq 1 180); do b=$(curl -fsS http://127.0.0.1:8000/healthz 2>/dev/null || true); case \"$b\" in *'\"db\":true'*'\"warm\":true'*) case '__TTS_MODE__' in clone) case \"$b\" in *'\"cloning_active\":true'*) touch /var/lib/voice/READY; echo READY; exit 0;; esac;; *) touch /var/lib/voice/READY; echo READY; exit 0;; esac;; esac; sleep 5; done; echo 'readiness timeout (see docker logs voice / cloudflared)' >&2; docker logs --tail 80 voice >&2 || true; docker logs --tail 80 cloudflared >&2 || true; exit 1" ]
+
+final_message: "voice bootstrap complete in $UPTIME seconds"

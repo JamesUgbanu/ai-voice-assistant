@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.protocol import (
     CLIENT_EVENTS,
+    SERVER_CAPABILITIES,
     SERVER_EVENTS,
     is_fatal_error,
     make_envelope,
@@ -82,6 +83,20 @@ class AudioFrameTest(unittest.TestCase):
             validate_audio_frame({"audio_b64": self._b64(320)}, max_frame_bytes=4096,
                                  max_turn_bytes=500, turn_bytes_so_far=400)
         self.assertEqual(ctx2.exception.code, "turn_too_long")
+
+
+class ServerCapabilitiesTest(unittest.TestCase):
+    def test_playback_complete_is_advertised(self):
+        # Clients gate the optional event on this capability, so an older server
+        # (which does not advertise it) is never sent an unknown event.
+        self.assertIn("playback_complete", SERVER_CAPABILITIES)
+
+    def test_session_created_carries_capabilities(self):
+        env = make_envelope(
+            "session_created",
+            {"session_id": "s", "max_seconds": 300, "capabilities": sorted(SERVER_CAPABILITIES)},
+        )
+        self.assertIn("playback_complete", env["payload"]["capabilities"])
 
 
 class PingThrottleTest(unittest.TestCase):

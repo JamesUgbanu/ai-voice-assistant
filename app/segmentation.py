@@ -49,16 +49,23 @@ class SegmentationBuffer:
         min_chars: int = 12,
         max_wait_ms: int = 1200,
         clause_trigger_chars: int = 80,
+        first_max_wait_ms: int | None = None,
         now_ms=None,
     ) -> None:
         self.max_chars = max(16, max_chars)
         self.hard_max_chars = max(self.max_chars, hard_max_chars)
         self.min_chars = max(1, min_chars)
         self.max_wait_ms = max(1, max_wait_ms)
+        # A shorter wait before the FIRST segment only: speech starts sooner
+        # (the measured first-audio delay), while later segments keep the full
+        # `max_wait_ms` so they stay natural and sentence-sized. Defaults to
+        # `max_wait_ms` (previous behavior) when unset.
+        self.first_max_wait_ms = max(1, first_max_wait_ms) if first_max_wait_ms is not None else self.max_wait_ms
         self.clause_trigger_chars = max(1, clause_trigger_chars)
         self._now = now_ms or (lambda: int(time.monotonic() * 1000))
         self._buf = ""
         self._pending_since: int | None = None
+        self._emitted_any = False
 
     # -- public API ---------------------------------------------------------
 
@@ -104,6 +111,7 @@ class SegmentationBuffer:
         """Discard all buffered text (turn cancelled / superseded)."""
         self._buf = ""
         self._pending_since = None
+        self._emitted_any = False
 
     # -- internals ----------------------------------------------------------
 
@@ -141,8 +149,11 @@ class SegmentationBuffer:
                 return self._emit(buf, c, now)
 
         # 5. Max wait — the stream stalled; emit everything buffered so the
-        #    final word isn't held back indefinitely.
-        waited = self._pending_since is not None and (now - self._pending_since) >= self.max_wait_ms
+        #    final word isn't held back indefinitely. The first segment uses a
+        #    shorter wait so speech starts sooner; later segments wait longer
+        #    for a natural sentence boundary.
+        limit = self.max_wait_ms if self._emitted_any else self.first_max_wait_ms
+        waited = self._pending_since is not None and (now - self._pending_since) >= limit
         if waited and len(buf.strip()) >= self.min_chars:
             return self._emit(buf, len(buf), now)
 
@@ -152,6 +163,7 @@ class SegmentationBuffer:
         seg = buf[:end].strip()
         rest = buf[end:].lstrip()
         self._buf = rest
+        self._emitted_any = True
         # Remaining text starts a fresh wait window; empty buffer clears it.
         self._pending_since = now if rest else None
         return seg

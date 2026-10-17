@@ -27,6 +27,13 @@ services:
     volumes:
       - voice-data:/srv/voice/data
       - voice-models:/srv/voice/models
+      # Authorized voice reference (read-only), required by clone mode. Copy the
+      # prepared WAV to ./voice-reference/processed/voice-ref.wav on the host
+      # (the file is Git-ignored and never baked into the image), then set
+      # VOICE_TTS_MODE=clone + VOICE_TTS_VOICE_REF in .env. Harmless when
+      # VOICE_TTS_MODE=preset — the directory is simply unused. Verify the live
+      # mode via /healthz (`.tts.cloning_active`) after warm-up.
+      - ./voice-reference/processed:/srv/voice/voice-reference/processed:ro
     networks:
       - voice-internal
     expose:

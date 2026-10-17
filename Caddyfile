@@ -11,7 +11,7 @@ voice.jamesugbanu.com {
 	encode gzip
 
 	@voice_api {
-		path /v1/sessions /v1/voice /healthz
+		path /v1/sessions /v1/voice /healthz /v1/transcribe /v1/transcribe/*
 	}
 	handle @voice_api {
 		reverse_proxy voice:8000 {

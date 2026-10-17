@@ -41,6 +41,9 @@ CLIENT_EVENTS = frozenset({
     "interrupt",
     "ping",
     "end_session",
+    # Client confirms its playback queue drained (used to gate auto-end so the
+    # closing goodbye is heard, not cut off).
+    "playback_complete",
 })
 
 SERVER_EVENTS = frozenset({
@@ -56,6 +59,15 @@ SERVER_EVENTS = frozenset({
     "pong",
     "session_ended",
 })
+
+#: Optional server features advertised in the `session_created` payload
+#: (`capabilities`). Clients MUST gate feature-specific client→server events on
+#: these, so an older server and a newer client never exchange an unknown event
+#: (which the strict envelope validator would reject as `bad_message`).
+SERVER_CAPABILITIES = frozenset({
+    "playback_complete",  # client can confirm playback drained (auto-end gate)
+})
+
 
 # Recoverable (client may continue) vs fatal (server closes after sending).
 RECOVERABLE_ERRORS = frozenset({

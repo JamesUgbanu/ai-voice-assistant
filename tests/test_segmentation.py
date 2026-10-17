@@ -123,6 +123,51 @@ class MaxWaitTest(unittest.TestCase):
         self.assertEqual(b.poll(now_ms=1001), ["beta gamma delta"])
 
 
+class FirstSegmentWaitTest(unittest.TestCase):
+    """The first spoken segment waits less than later segments (start sooner)."""
+
+    def test_first_segment_emits_at_first_wait_not_full_wait(self):
+        b = SegmentationBuffer(max_wait_ms=1200, first_max_wait_ms=500, min_chars=5)
+        self.assertEqual(b.push("this is a stalled thought", now_ms=0), [])
+        self.assertEqual(b.poll(now_ms=499), [])
+        self.assertEqual(b.poll(now_ms=501), ["this is a stalled thought"])
+
+    def test_later_segments_use_the_full_wait(self):
+        b = SegmentationBuffer(
+            max_wait_ms=1200, first_max_wait_ms=500, min_chars=5, clause_trigger_chars=9999
+        )
+        self.assertEqual(b.push("first stalled chunk here", now_ms=0), [])
+        self.assertEqual(b.poll(now_ms=501), ["first stalled chunk here"])
+        self.assertEqual(b.push("second stalled chunk here", now_ms=600), [])
+        # 400 ms after the second started: full wait still pending.
+        self.assertEqual(b.poll(now_ms=1000), [])
+        self.assertEqual(b.poll(now_ms=1801), ["second stalled chunk here"])
+
+    def test_defaults_to_previous_behavior_when_unset(self):
+        b = SegmentationBuffer(max_wait_ms=1000, min_chars=5)
+        self.assertEqual(b.push("stalled thought here", now_ms=0), [])
+        self.assertEqual(b.poll(now_ms=999), [])
+        self.assertEqual(b.poll(now_ms=1001), ["stalled thought here"])
+
+    def test_reset_restores_first_segment_behavior(self):
+        b = SegmentationBuffer(max_wait_ms=1200, first_max_wait_ms=500, min_chars=5)
+        b.push("first chunk long enough", now_ms=0)
+        b.poll(now_ms=501)
+        b.reset()
+        b.push("new turn stalled chunk", now_ms=1000)
+        self.assertEqual(b.poll(now_ms=1499), [])
+        self.assertEqual(b.poll(now_ms=1501), ["new turn stalled chunk"])
+
+    def test_natural_sentence_boundary_still_wins_over_first_wait(self):
+        b = SegmentationBuffer(max_wait_ms=1200, first_max_wait_ms=500, min_chars=5)
+        # A boundary inside the window is emitted immediately, not held.
+        self.assertEqual(b.push("Hello there!", now_ms=0), ["Hello there!"])
+        # A trailing "." waits for the next character (abbreviation guard), then
+        # emits at the boundary rather than the first-wait deadline.
+        self.assertEqual(b.push("Are you well.", now_ms=10), [])
+        self.assertEqual(b.push(" Yes.", now_ms=20), ["Are you well."])
+
+
 class FlushResetTest(unittest.TestCase):
     def test_flush_emits_remainder_and_clears(self):
         b = SegmentationBuffer()

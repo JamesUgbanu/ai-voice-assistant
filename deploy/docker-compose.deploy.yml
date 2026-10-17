@@ -1,0 +1,29 @@
+# Optional manual/alternative deployment on a provisioned host. The cloud-init
+# bootstrap uses `docker run` directly; this file exists for operators who prefer
+# Compose. It contains NO secrets (they live in /etc/voice/runtime.env, 0600).
+# Pin an immutable tag/digest via VOICE_IMAGE; never use `latest` in production.
+#
+# Option A: the authorized voice reference is baked into the private image.
+# Do NOT mount a host reference directory here: it would shadow the baked file
+# and clone readiness would fail closed.
+#
+# This publishes the API on loopback only. Put a TLS front proxy (Caddy) in
+# front and do not expose 8000 publicly.
+services:
+  voice:
+    image: ${VOICE_IMAGE:?set VOICE_IMAGE to an immutable ghcr.io/...:VERSION}
+    restart: unless-stopped
+    env_file: /etc/voice/runtime.env
+    environment:
+      VOICE_DB_PATH: /srv/voice/data/voice.sqlite3
+      HF_HOME: /srv/voice/models
+      XDG_CACHE_HOME: /srv/voice/models
+      TORCH_HOME: /srv/voice/models/torch
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - voice-data:/srv/voice/data
+      - voice-models:/srv/voice/models
+volumes:
+  voice-data:
+  voice-models:

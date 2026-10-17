@@ -2,6 +2,7 @@
 
 Transport injected as a fake async context manager — no network, no httpx.
 """
+import asyncio
 import os
 import sys
 import unittest
@@ -155,6 +156,105 @@ class IterAnswerTest(unittest.IsolatedAsyncioTestCase):
             await collect(iter_answer(client, "https://x", "t", "hi"))
         self.assertEqual(ctx.exception.code, "bad_question")
         self.assertEqual(client.calls, [])
+
+
+class _DelayedResponse(FakeStreamResponse):
+    async def aiter_text(self):
+        await asyncio.sleep(0.02)  # first body byte is deliberately late
+        for c in self._chunks:
+            yield c
+
+
+class _CancelResponse(FakeStreamResponse):
+    async def aiter_text(self):
+        # Body read is cancelled before any byte arrives. CancelledError is a
+        # BaseException, so it must propagate (not be reclassified) and must
+        # not produce a TTFB.
+        raise asyncio.CancelledError()
+        yield ""  # pragma: no cover — makes this an async generator
+
+
+class RagTtfbTest(unittest.IsolatedAsyncioTestCase):
+    """Request→first-body-byte (TTFB) instrumentation. Metric presence and
+    ordering only — no brittle exact-millisecond assertions."""
+
+    async def test_ttfb_reported_once_before_first_token(self):
+        log: list = []
+        body = sse(("meta", "{}"), ("token", '{"text":"one "}'), ("token", '{"text":"two"}'))
+        client = FakeStreamClient(FakeStreamResponse(200, [body]))
+        agen = iter_answer(client, "https://x", "t", "valid question", on_ttfb=lambda ms: log.append(ms))
+        first = await agen.__anext__()
+        self.assertEqual(first, "one ")
+        # TTFB fired at/before the first token, exactly once, non-negative int.
+        self.assertEqual(len(log), 1)
+        self.assertIsInstance(log[0], int)
+        self.assertGreaterEqual(log[0], 0)
+        rest = [c async for c in agen]
+        self.assertEqual(rest, ["two"])
+        self.assertEqual(len(log), 1)  # never repeated per chunk
+
+    async def test_first_byte_and_first_token_in_same_chunk(self):
+        log: list = []
+        client = FakeStreamClient(FakeStreamResponse(200, [sse(("token", '{"text":"Hi."}'))]))
+        chunks = await collect(iter_answer(client, "https://x", "t", "valid question", on_ttfb=lambda ms: log.append(ms)))
+        self.assertEqual(chunks, ["Hi."])
+        self.assertEqual(len(log), 1)
+
+    async def test_delayed_first_byte_still_recorded(self):
+        log: list = []
+        client = FakeStreamClient(_DelayedResponse(200, [sse(("token", '{"text":"late"}'))]))
+        await collect(iter_answer(client, "https://x", "t", "valid question", on_ttfb=lambda ms: log.append(ms)))
+        self.assertEqual(len(log), 1)
+        self.assertGreaterEqual(log[0], 0)
+
+    async def test_no_ttfb_on_empty_body(self):
+        log: list = []
+        client = FakeStreamClient(FakeStreamResponse(200, []))
+        with self.assertRaises(RagError) as ctx:
+            await collect(iter_answer(client, "https://x", "t", "valid question", on_ttfb=lambda ms: log.append(ms)))
+        self.assertEqual(ctx.exception.code, "empty_answer")
+        self.assertEqual(log, [])  # no body byte → no fabricated timing
+
+    async def test_no_ttfb_on_http_error_before_body(self):
+        log: list = []
+        client = FakeStreamClient(FakeStreamResponse(503, []))
+        with self.assertRaises(RagError) as ctx:
+            await collect(iter_answer(client, "https://x", "t", "valid question", on_ttfb=lambda ms: log.append(ms)))
+        self.assertEqual(ctx.exception.code, "http_error")
+        self.assertEqual(log, [])
+
+    async def test_no_ttfb_on_transport_failure(self):
+        log: list = []
+        client = FakeStreamClient(exc=ConnectionError("down"))
+        with self.assertRaises(RagError):
+            await collect(iter_answer(client, "https://x", "t", "valid question", on_ttfb=lambda ms: log.append(ms)))
+        self.assertEqual(log, [])
+
+    async def test_no_ttfb_on_timeout_before_body(self):
+        log: list = []
+        client = FakeStreamClient(exc=TimeoutError("timed out"))
+        with self.assertRaises(RagError) as ctx:
+            await collect(iter_answer(client, "https://x", "t", "valid question", on_ttfb=lambda ms: log.append(ms)))
+        self.assertEqual(ctx.exception.code, "transport")
+        self.assertEqual(log, [])
+
+    async def test_cancellation_before_body_propagates_without_ttfb(self):
+        log: list = []
+        client = FakeStreamClient(_CancelResponse(200, [sse(("token", '{"text":"never"}'))]))
+        with self.assertRaises(asyncio.CancelledError):
+            await collect(iter_answer(client, "https://x", "t", "valid question", on_ttfb=lambda ms: log.append(ms)))
+        self.assertEqual(log, [])  # no byte → no fabricated timing
+
+    async def test_ttfb_sinks_are_per_call(self):
+        a: list = []
+        b: list = []
+        ca = FakeStreamClient(FakeStreamResponse(200, [sse(("token", '{"text":"a"}'))]))
+        cb = FakeStreamClient(FakeStreamResponse(200, [sse(("token", '{"text":"b"}'))]))
+        await collect(iter_answer(ca, "https://x", "t", "valid question", on_ttfb=lambda ms: a.append(ms)))
+        await collect(iter_answer(cb, "https://x", "t", "valid question", on_ttfb=lambda ms: b.append(ms)))
+        self.assertEqual(len(a), 1)
+        self.assertEqual(len(b), 1)
+        self.assertIsNot(a, b)
 
 
 if __name__ == "__main__":

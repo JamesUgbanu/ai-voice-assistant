@@ -29,6 +29,14 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
 
 COPY app ./app
 
+# Option A (authorized): bake the authorized voice-cloning reference into the
+# PRIVATE image at the exact runtime path. PRIVACY TRADE-OFF: anyone able to
+# pull this image can extract and reuse the biometric reference. The registry
+# must stay private with tightly restricted, read-only pull access; the file is
+# git-ignored and never logged. Placed before the chown so it is owned by the
+# non-root runtime user.
+COPY deploy/reference/voice-ref.wav /srv/voice/voice-reference/processed/voice-ref.wav
+
 RUN getent group voice >/dev/null || groupadd -r voice; \
     id -u voice >/dev/null 2>&1 || useradd -r -g voice --create-home --shell /usr/sbin/nologin voice && \
     mkdir -p /srv/voice/data /srv/voice/models && \

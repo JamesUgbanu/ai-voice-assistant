@@ -47,9 +47,21 @@ class TurnTimings:
     so they serialize directly into the structured timing log."""
 
     stt_ms: int = 0
+    # True when the turn reused an exact-length incremental decode instead of
+    # running the final STT (identical bytes → identical transcript).
+    stt_reused: bool = False
     rag_ms: int = 0
+    # RAG request → first response-BODY chunk (time-to-first-byte), reported by
+    # the RAG client via `ttfb_out`. Distinct from rag_ms (request → first
+    # usable token): TTFB isolates connection/queue/remote-precompute from the
+    # post-byte wait to the first token. 0 = not measured (no body byte arrived).
+    rag_ttfb_ms: int = 0
     tts_first_ms: int = 0
     tts_total_ms: int = 0
+    # RAG first token → first synthesis start: how long the segmentation
+    # buffer held text before speaking. The directly-attributable first-audio
+    # wait (the first-segment max-wait lever). 0 when the RAG path is not used.
+    seg_wait_ms: int = 0
     # RAG first-token → last-token (the tail rag_ms misses); when no token
     # ever arrived, time spent waiting instead, so stalls read nonzero.
     # Stays 0 only if the RAG section is never entered.
@@ -112,6 +124,15 @@ async def run_turn(
     # default) disables it entirely; a directory path enables WAV+JSON writes
     # for every transcribed turn. Local diagnostics only — never production.
     diag_dir: str | None = None,
+    # A decode the caller already holds for EXACTLY this audio (from the
+    # incremental partial path). When present it replaces the final STT call;
+    # the caller guarantees byte-identical input, so the transcript cannot
+    # differ from a fresh decode. None (default) = normal full decode.
+    preexisting_transcript: Any | None = None,
+    # Per-turn sink the RAG stream writes its request→first-body-byte duration
+    # into (key "ms"). Scoped to one turn by the caller so concurrent turns can
+    # never mix timings. None (default) = no TTFB capture.
+    ttfb_out: dict | None = None,
 ) -> tuple[TurnResult, TurnTimings]:
     """Execute one turn. Pure orchestration; all side effects via callables.
     `emit_audio_frame(pcm_bytes, final)` may be sync or async. `on_transcript`
@@ -139,17 +160,29 @@ async def run_turn(
         state.transition("idle")
         return TurnResult(turn_id, "", "", 0), timings
 
-    # 2. STT in a worker thread (blocking native call).
-    try:
-        transcript_obj = await asyncio.to_thread(stt.transcribe, audio, stt_config)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        return _fail(state, turn_id, timings, "stt_failed")
+    # 2. STT in a worker thread (blocking native call). When the incremental
+    # path already decoded exactly this audio, reuse that decode: the input
+    # bytes are identical, so the transcript is identical, and the turn skips
+    # the final decode entirely (the end-of-speech → final latency win).
+    reuse = (
+        preexisting_transcript
+        if (getattr(preexisting_transcript, "text", "") or "").strip()
+        else None
+    )
+    if reuse is not None:
+        transcript_obj = reuse
+        timings.stt_reused = True
+    else:
+        try:
+            transcript_obj = await asyncio.to_thread(stt.transcribe, audio, stt_config)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _fail(state, turn_id, timings, "stt_failed")
     timings.stt_ms = clock() - t0
     transcript = (transcript_obj.text or "").strip()
     diag_id: str | None = None
-    if diag_dir:
+    if diag_dir and not timings.stt_reused:
         # Exact bytes just handed to stt.transcribe, plus everything needed
         # to replay the decision offline. Best-effort: capture must never
         # fail the turn, so errors are swallowed after one attempt.
@@ -185,7 +218,7 @@ async def run_turn(
           audio_secs=round(len(audio) / 32000, 2), chars=len(transcript),
           logprob=getattr(transcript_obj, "avg_logprob", None),
           no_speech=bool(getattr(transcript_obj, "no_speech", False)),
-          ms=timings.stt_ms, diag_id=diag_id)
+          ms=timings.stt_ms, reused=timings.stt_reused, diag_id=diag_id)
     if not transcript or getattr(transcript_obj, "no_speech", False):
         state.transition("idle")
         return TurnResult(turn_id, "", "", 0), timings
@@ -223,12 +256,14 @@ async def run_turn(
         tts_started = False
         first_chunk = True
         t_first_synth: int | None = None
+        t_first_token: int | None = None
         seg = segmentation or {}
         buffer = SegmentationBuffer(now_ms=clock, **seg)
         answer_parts: list[str] = []
-        # Poll faster than the segmentation max-wait so a quiet upstream can
-        # never hold pending text (and therefore first audio) hostage.
-        poll_s = max(0.05, min(0.25, seg.get("max_wait_ms", 1200) / 4000.0))
+        # Poll faster than the (possibly shorter) first-segment max-wait so a
+        # quiet upstream can never hold pending text — and first audio — hostage.
+        poll_wait = min(seg.get("max_wait_ms", 1200), seg.get("first_max_wait_ms", 1200))
+        poll_s = max(0.05, min(0.25, poll_wait / 4000.0))
 
         async def speak(segment: str) -> None:
             nonlocal frames, tts_started, t_first_synth
@@ -238,6 +273,10 @@ async def run_turn(
                 state.transition("speaking")
             if t_first_synth is None:
                 t_first_synth = clock()
+                # First-audio wait caused by segmentation, isolated from STT
+                # and RAG (measured against the RAG first token).
+                if t_first_token is not None:
+                    timings.seg_wait_ms = t_first_synth - t_first_token
             # TEMPORARY TTS emission diagnostic (VOICE_TTS_DIAG=1): measures
             # per-segment synthesis span and frame count so inter-segment gaps
             # (segmentation/RAG waits) can be separated from intra-segment
@@ -362,6 +401,11 @@ async def run_turn(
                 t_last_token = clock()
                 if first_chunk:
                     timings.rag_ms = clock() - t_rag
+                    t_first_token = clock()
+                    if ttfb_out is not None:
+                        ms = ttfb_out.get("ms")
+                        if isinstance(ms, int) and ms >= 0:
+                            timings.rag_ttfb_ms = ms
                     first_chunk = False
                 if not alive():
                     buffer.reset()

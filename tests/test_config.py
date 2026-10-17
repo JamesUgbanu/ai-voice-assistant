@@ -40,6 +40,27 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(s.session_attempts, 1)       # clamped to minimum
         self.assertEqual(s.stale_session_seconds, 120)
 
+    def test_tts_first_segment_wait_default_and_bounds(self):
+        # First spoken segment starts sooner; later segments keep the full wait.
+        self.assertEqual(Settings(env={}).tts_first_max_wait_ms, 600)
+        self.assertEqual(Settings(env={}).tts_max_wait_ms, 1200)
+        self.assertEqual(Settings(env={"VOICE_TTS_FIRST_MAX_WAIT_MS": "450"}).tts_first_max_wait_ms, 450)
+        self.assertEqual(Settings(env={"VOICE_TTS_FIRST_MAX_WAIT_MS": "50"}).tts_first_max_wait_ms, 100)
+        self.assertEqual(Settings(env={"VOICE_TTS_FIRST_MAX_WAIT_MS": "99999"}).tts_first_max_wait_ms, 10000)
+
+    def test_tts_mode_parsing(self):
+        # Default is the built-in preset voice; "clone" is opt-in via env and
+        # an unknown value fails closed to preset (never a silent clone).
+        self.assertEqual(Settings(env={}).tts_mode, "preset")
+        self.assertEqual(Settings(env={"VOICE_TTS_MODE": "clone"}).tts_mode, "clone")
+        self.assertEqual(Settings(env={"VOICE_TTS_MODE": "CLONE"}).tts_mode, "clone")
+        self.assertEqual(Settings(env={"VOICE_TTS_MODE": "weird"}).tts_mode, "preset")
+        s = Settings(env={"VOICE_TTS_MODE": "clone",
+                          "VOICE_TTS_VOICE_REF": "/srv/voice/ref.wav"})
+        self.assertEqual(s.tts_voice_ref, "/srv/voice/ref.wav")
+        # Preset voice name is configurable and defaults to the built-in.
+        self.assertEqual(Settings(env={}).tts_preset_voice, "alba")
+
     def test_rag_configured_only_when_complete(self):
         self.assertFalse(Settings(env={"VOICE_RAG_API_URL": "https://x"}).rag_configured)
         self.assertFalse(Settings(env={"VOICE_RAG_SERVICE_TOKEN": "t"}).rag_configured)

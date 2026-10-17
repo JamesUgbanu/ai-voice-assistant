@@ -26,8 +26,11 @@ from . import auth, rag_client, store
 from .config import Settings
 from .logging_util import configure, event
 from .pipeline import run_turn, turn_end_reason
+from .partial_stt import PartialTranscriber
+from .conversation_end import CallLifecycle, classify_completion, ending_wait_seconds
 from .greeting import greeting_reply
 from .protocol import (
+    SERVER_CAPABILITIES,
     is_fatal_error,
     make_envelope,
     should_answer_ping,
@@ -57,10 +60,30 @@ _metrics: dict[str, int] = {}
 #: creation waits on it so the first turn never races a cold model load.
 _warm_event = threading.Event()
 _warm_error: str | None = None
+#: Resolved TTS voice mode, populated at warm-up from the loaded backend's
+#: ``describe()``. Reported on /healthz so a preset/fallback voice can never
+#: silently stand in for the intended cloned voice (no paths, no audio).
+_tts_status: dict = {}
 _httpx_client = None
 #: Composer-dictation rate limits (in-process, single worker).
 _transcribe_throttle = WindowLimiter()
 _ticket_throttle = WindowLimiter()
+#: Cross-session single-flight gate for incremental (partial) transcription.
+#: The STT model and one CPU core are shared; a partial decode from another
+#: connection must never build a backlog ahead of a turn's final decode.
+_partial_gate_sem = None
+_partial_gate_lock = threading.Lock()
+
+
+def _partial_gate():
+    """Lazily create the shared partial-decode semaphore inside the running
+    loop (never at import time)."""
+    global _partial_gate_sem
+    if _partial_gate_sem is None:
+        with _partial_gate_lock:
+            if _partial_gate_sem is None:
+                _partial_gate_sem = asyncio.Semaphore(1)
+    return _partial_gate_sem
 
 
 def metric(name: str, delta: int = 1) -> None:
@@ -173,7 +196,17 @@ def create_app() -> FastAPI:
             db_ok = True
         except Exception:
             db_ok = False
-        return {"status": "ok" if db_ok else "degraded", "db": db_ok, "warm": _warm_event.is_set()}
+        # Voice-mode self-report: which TTS voice is actually active, so a
+        # preset/fallback voice standing in for the cloned one is visible
+        # without reading logs. Booleans/short strings only — never a path.
+        tts = {"mode": settings.tts_mode, "ref_configured": bool(settings.tts_voice_ref)}
+        tts.update(_tts_status or {})
+        return {
+            "status": "ok" if db_ok else "degraded",
+            "db": db_ok,
+            "warm": _warm_event.is_set(),
+            "tts": tts,
+        }
 
     @app.get("/metrics")
     async def metrics():
@@ -496,9 +529,92 @@ async def _handle_socket(websocket: WebSocket) -> None:
     last_ping_at = 0.0
     started_at = float(row["started_at"])
     max_seconds = int(row["max_seconds"])
+    # Monotonic marks for the streaming-latency breakdown (per turn).
+    turn_started_at = 0.0
+    eou_at = 0.0
+    partial_times: dict = {"first": None}
 
     async def send(env: dict) -> None:
         await websocket.send_json(env)
+
+    async def emit_partial(text: str, seq: int, tid: str) -> None:
+        if partial_times["first"] is None:
+            partial_times["first"] = time.monotonic()
+        await send(
+            make_envelope("transcript_partial", {"text": text, "seq": seq, "turn_id": tid})
+        )
+
+    # Incremental transcription while the user speaks. Disabled by config, in
+    # which case nothing below emits and the previous behavior is exact.
+    partial = PartialTranscriber(
+        stt=stt,
+        stt_config=stt_config,
+        emit=emit_partial,
+        enabled=settings.stt_streaming,
+        interval_ms=settings.stt_partial_interval_ms,
+        min_audio_ms=settings.stt_partial_min_audio_ms,
+        max_audio_seconds=settings.stt_partial_max_audio_seconds,
+        gate=_partial_gate(),
+        on_error=lambda _name: metric("partial_stt_failed"),
+    )
+
+    # --- Automatic call termination (ACTIVE → ENDING → TERMINATED) ----------
+    # The agent may end a clearly-concluded conversation. The decision is a
+    # deterministic structured value (never raw generated text); the closing
+    # goodbye is spoken through the normal pipeline, and termination reuses the
+    # same session-end path as a client hangup. Idempotent by construction.
+    call = CallLifecycle()
+    playback_done = asyncio.Event()
+    terminate_task: asyncio.Task | None = None
+
+    async def terminate_call(reason: str) -> None:
+        """Single, idempotent termination funnel (agent- or user-initiated)."""
+        if not call.terminate():
+            return
+        try:
+            await db_call(store.end_session, session_id, time.time(), reason)
+        except Exception:
+            pass
+        try:
+            await send(make_envelope("session_ended", {"reason": reason}))
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1000)
+        except Exception:
+            pass
+
+    async def begin_ending(frames: int) -> None:
+        """Speak-complete → wait (bounded) for playback → terminate. Reversible
+        until the client confirms playback or the bound elapses."""
+        nonlocal terminate_task
+        if not call.begin_ending():
+            return
+        playback_done.clear()
+        metric("auto_end_started")
+
+        async def _finish() -> None:
+            timeout = min(settings.playback_timeout_ms / 1000.0, ending_wait_seconds(frames))
+            try:
+                await asyncio.wait_for(playback_done.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                # Documented fallback: playback could not be confirmed; end the
+                # call anyway rather than leaving it open indefinitely.
+                event(logger, "auto_end_playback_timeout", bound_ms=int(timeout * 1000))
+            await terminate_call("agent_ended")
+
+        terminate_task = asyncio.create_task(_finish())
+
+    def cancel_ending() -> None:
+        """The caller resumed speaking during ENDING → back to ACTIVE."""
+        nonlocal terminate_task
+        if not call.cancel_ending():
+            return
+        if terminate_task is not None and not terminate_task.done():
+            terminate_task.cancel()
+        terminate_task = None
+        playback_done.clear()
+        metric("auto_end_cancelled")
 
     async def session_alive() -> bool:
         fresh = await db_call(store.get_session, session_id)
@@ -529,13 +645,32 @@ async def _handle_socket(websocket: WebSocket) -> None:
         turn_cancel = None
         audio_buf = bytearray()
         audio_frames = 0
+        # A cancelled/superseded turn must not keep emitting partials.
+        await partial.stop()
         await send(make_envelope("turn_end", {"reason": reason, "turn_id": turn_id}))
         # Interrupted/cancelled turns leave inference scratch behind; hand it
         # back to the OS now rather than holding it as idle RSS.
         await asyncio.to_thread(_trim_memory)
 
-    async def run_utterance(turn_id: str, pcm: bytes) -> None:
+    async def run_utterance(
+        turn_id: str, pcm: bytes, reused_transcript=None, decision: dict | None = None
+    ) -> None:
         nonlocal turn_cancel, turn_task
+        # When the incremental path already decoded exactly this audio, the
+        # pipeline reuses it and the final transcript is immediate.
+        final_at: dict = {"t": None}
+
+        async def on_transcript(text: str) -> None:
+            final_at["t"] = time.monotonic()
+            # Structured completion decision from the finalized transcript. The
+            # decision only *marks* the turn; the orchestrator enforces the
+            # lifecycle and speaks a fixed closing (no extra LLM request).
+            completion = classify_completion(text, settings.end_call_confidence)
+            if completion.should_end_call and decision is not None:
+                decision["should_end"] = True
+                decision["reason"] = completion.reason
+            await send(make_envelope("transcript_final", {"text": text, "turn_id": turn_id}))
+
         if not await session_alive():
             await send(make_envelope("error", {"code": "session_expired", "message": "Call time is up."}))
             await send(make_envelope("session_ended", {"reason": "max_duration"}))
@@ -558,6 +693,11 @@ async def _handle_socket(websocket: WebSocket) -> None:
             )
             return out.text
 
+        # Per-turn TTFB sink: the RAG stream writes request→first-body-byte here.
+        # Scoped to this turn (a fresh dict per utterance) so concurrent turns
+        # can never overwrite each other's timing.
+        ttfb_out: dict = {}
+
         async def rag_stream(text: str):
             # Stream the portfolio answer token-by-token so TTS can start on
             # the first natural segment instead of the full response.
@@ -573,6 +713,7 @@ async def _handle_socket(websocket: WebSocket) -> None:
                 timeout_seconds=settings.rag_timeout_seconds,
                 should_stop=(lambda: stop_event.is_set()) if stop_event else None,
                 mode="voice",
+                on_ttfb=lambda ms: ttfb_out.__setitem__("ms", ms),
             ):
                 yield chunk
 
@@ -595,6 +736,13 @@ async def _handle_socket(websocket: WebSocket) -> None:
                 }
             )
 
+        def _fast_reply(text: str, obj: object) -> str | None:
+            # A concluded conversation speaks the fixed closing (no RAG round
+            # trip); otherwise the existing deterministic greeting fast path.
+            if decision is not None and decision.get("should_end"):
+                return settings.end_call_closing
+            return greeting_reply(text, getattr(obj, "avg_logprob", None))
+
         try:
             result, timings = await run_turn(
                 state=state,
@@ -611,22 +759,27 @@ async def _handle_socket(websocket: WebSocket) -> None:
                 tts_config=tts_config,
                 emit_audio_frame=emit_frame,
                 segmentation=_segmentation_config(),
-                fast_reply=lambda text, obj: greeting_reply(text, getattr(obj, "avg_logprob", None)),
-                on_transcript=lambda text: send(
-                    make_envelope("transcript_final", {"text": text, "turn_id": turn_id})
-                ),
+                fast_reply=lambda text, obj: _fast_reply(text, obj),
+                on_transcript=on_transcript,
                 diag_dir=_diag_capture_dir(),
+                preexisting_transcript=reused_transcript,
+                ttfb_out=ttfb_out,
             )
         except asyncio.CancelledError:
             return
+        if decision is not None:
+            decision["frames"] = result.audio_frames
         # Stage-by-stage timing for one turn (monotonic durations, no PII).
         event(
             logger,
             "turn_timing",
             turn=turn_id,
             stt_ms=timings.stt_ms,
+            stt_reused=timings.stt_reused,
             rag_ms=timings.rag_ms,
+            rag_ttfb_ms=timings.rag_ttfb_ms,
             rag_total_ms=timings.rag_total_ms,
+            seg_wait_ms=timings.seg_wait_ms,
             tts_first_ms=timings.tts_first_ms,
             first_audio_ms=timings.first_audio_ms,
             tts_total_ms=timings.tts_total_ms,
@@ -635,6 +788,27 @@ async def _handle_socket(websocket: WebSocket) -> None:
             fast_path=result.fast_path,
             cancelled=result.cancelled,
             error=result.error,
+        )
+        # Incremental-transcription breakdown (monotonic, no audio/text):
+        # how many partials the user saw, when the first one arrived, and the
+        # end-of-speech → final-transcript cost the streaming path changed.
+        event(
+            logger,
+            "turn_streaming",
+            turn=turn_id,
+            partials=partial.emitted,
+            stt_reused=timings.stt_reused,
+            first_partial_ms=(
+                int((partial_times["first"] - turn_started_at) * 1000)
+                if partial_times["first"] is not None and turn_started_at
+                else None
+            ),
+            eou_to_final_ms=(
+                int((final_at["t"] - eou_at) * 1000)
+                if final_at["t"] is not None and eou_at
+                else None
+            ),
+            stt_ms=timings.stt_ms,
         )
         # The turn-end decision comes from the result, never from
         # state.is_current: a completed turn is already idle, so gating the
@@ -654,7 +828,10 @@ async def _handle_socket(websocket: WebSocket) -> None:
         # Return inference scratch (TTS/RAG buffers) to the OS after the turn.
         await asyncio.to_thread(_trim_memory)
 
-    await send(make_envelope("session_created", {"session_id": session_id, "max_seconds": max_seconds}))
+    await send(make_envelope(
+        "session_created",
+        {"session_id": session_id, "max_seconds": max_seconds, "capabilities": sorted(SERVER_CAPABILITIES)},
+    ))
     await send(make_envelope("listening", {}))
 
     try:
@@ -695,8 +872,15 @@ async def _handle_socket(websocket: WebSocket) -> None:
                     return
                 await send(make_envelope("pong", {}))
             elif etype == "audio_frame":
+                # The caller resumed speaking during ENDING: cancel the pending
+                # (still-reversible) termination and continue the conversation.
+                if call.reversible:
+                    cancel_ending()
                 if state.state == "idle":
                     state.begin_turn()
+                    turn_started_at = time.monotonic()
+                    partial_times["first"] = None
+                    partial.begin(state.turn_id)
                 try:
                     max_turn = settings.max_turn_audio_seconds * settings.sample_rate * 2
                     raw_pcm = validate_audio_frame(
@@ -708,6 +892,13 @@ async def _handle_socket(websocket: WebSocket) -> None:
                     state.add_audio(len(raw_pcm), max_turn)
                     audio_buf.extend(raw_pcm)
                     audio_frames += 1
+                    # Offer the growing utterance to the incremental path. It
+                    # skips (never queues) when a decode is in flight or the
+                    # debounce/increment threshold is not met.
+                    if state.state == "collecting" and state.turn_id is not None:
+                        partial.maybe_start(
+                            audio_buf, state.turn_id, int(time.monotonic() * 1000)
+                        )
                 except (ValueError, OverflowError) as exc:
                     code = "turn_too_long" if isinstance(exc, OverflowError) else "bad_message"
                     await send(make_envelope("error", {"code": code, "message": str(exc)}))
@@ -732,6 +923,7 @@ async def _handle_socket(websocket: WebSocket) -> None:
                     # all and the client waited out its full timeout.)
                     interrupted = turn_task is not None and not turn_task.done()
                     event(logger, "empty_end_utterance", turn_active=interrupted)
+                    await partial.stop()
                     if interrupted:
                         continue
                     try:
@@ -740,8 +932,18 @@ async def _handle_socket(websocket: WebSocket) -> None:
                         pass
                     await send(make_envelope("turn_end", {"reason": "empty", "turn_id": None}))
                     continue
+                eou_at = time.monotonic()
+                # Let any in-flight partial finish, then reuse it ONLY when it
+                # decoded the exact final buffer: identical bytes give an
+                # identical transcript, so this cannot clip a trailing word.
+                # A shorter window (the usual case) settles to None and the
+                # pipeline runs the authoritative full decode as before.
+                reused = await partial.settle(len(pcm))
+                partial_count = partial.emitted
+                await partial.stop()
                 event(logger, "utterance_audio", frames=nframes,
-                      bytes=len(pcm), secs=round(len(pcm) / 32000, 2))
+                      bytes=len(pcm), secs=round(len(pcm) / 32000, 2),
+                      partials=partial_count, stt_reused=reused is not None)
                 if turn_task is not None and not turn_task.done():
                     await end_turn_state("interrupted")
                     state.begin_turn()
@@ -749,24 +951,32 @@ async def _handle_socket(websocket: WebSocket) -> None:
                 if tid is None:
                     continue
 
-                async def _guarded(tid_: str = tid, pcm_: bytes = pcm) -> None:
+                async def _guarded(tid_: str = tid, pcm_: bytes = pcm, reused_=reused) -> None:
+                    decision: dict = {}
                     try:
-                        await run_utterance(tid_, pcm_)
+                        await run_utterance(tid_, pcm_, reused_, decision)
                     except Exception as exc:
                         event(logger, "turn_failed", error=type(exc).__name__)
                         try:
                             await send(make_envelope("turn_end", {"reason": "server_error", "turn_id": tid_}))
                         except Exception:
                             pass
+                        return
+                    # The conversation clearly ended: speak the closing (already
+                    # emitted) then end the call after playback. Idempotent.
+                    if decision.get("should_end"):
+                        await begin_ending(int(decision.get("frames", 0)))
 
                 turn_task = asyncio.create_task(_guarded())
+            elif etype == "playback_complete":
+                # Client confirms its audio queue drained; releases the bounded
+                # auto-end wait so the goodbye is never cut off.
+                playback_done.set()
             elif etype == "interrupt":
                 await end_turn_state("interrupted")
                 await send(make_envelope("listening", {}))
             elif etype == "end_session":
-                await db_call(store.end_session, session_id, time.time(), "user_ended")
-                await send(make_envelope("session_ended", {"reason": "user_ended"}))
-                await websocket.close(code=1000)
+                await terminate_call("user_ended")
                 return
             elif etype == "hello":
                 await send(make_envelope("error", {"code": "bad_message", "message": "Session already open."}))
@@ -777,6 +987,8 @@ async def _handle_socket(websocket: WebSocket) -> None:
         # Never strand quota.
         if turn_task is not None and not turn_task.done():
             turn_task.cancel()
+        # Drop any in-flight partial so it cannot emit onto a dead socket.
+        await partial.stop()
         metric("disconnects")
         return
 
@@ -798,6 +1010,7 @@ def _stt_config():
 def _segmentation_config() -> dict:
     return {
         "max_wait_ms": settings.tts_max_wait_ms,
+        "first_max_wait_ms": settings.tts_first_max_wait_ms,
         "clause_trigger_chars": settings.tts_clause_trigger_chars,
         "max_chars": settings.tts_max_chars,
         "min_chars": settings.tts_min_chars,
@@ -817,7 +1030,7 @@ async def warm_models() -> None:
         stt_cfg, tts_cfg = _stt_config(), _tts_config()
 
         def _work() -> dict:
-            stamps: dict[str, int | str] = {}
+            stamps: dict[str, object] = {}
             t_all = time.time()
             t = time.time()
             try:
@@ -839,6 +1052,10 @@ async def warm_models() -> None:
                     tts.preflight(tts_cfg)
                 else:
                     tts.synthesize_full("Ready.", tts_cfg)
+                # Resolved voice mode (preset/clone + cloning_active), so
+                # /healthz can prove the intended voice is the active one.
+                if hasattr(tts, "describe"):
+                    stamps["tts_status"] = tts.describe()
                 stamps["tts_ms"] = int((time.time() - t) * 1000)
             except Exception as exc:  # noqa: BLE001
                 stamps["tts_error"] = type(exc).__name__
@@ -846,9 +1063,15 @@ async def warm_models() -> None:
             return stamps
 
         stamps = await asyncio.to_thread(_work)
-        # Selected STT model is logged so the running configuration is always
-        # verifiable (e.g. local small.en evaluation vs production base.en).
-        event(logger, "models_warm", stt_model=settings.stt_model, **stamps)
+        global _tts_status
+        resolved = stamps.pop("tts_status", None)
+        if isinstance(resolved, dict):
+            _tts_status = resolved
+        # Selected STT model and resolved TTS voice status are logged so the
+        # running configuration is always verifiable (e.g. base.en in production
+        # vs local small.en; preset vs clone voice).
+        event(logger, "models_warm", stt_model=settings.stt_model,
+              tts_status=resolved, **stamps)
     except Exception as exc:  # noqa: BLE001
         global _warm_error
         _warm_error = type(exc).__name__

@@ -390,5 +390,45 @@ class IncrementalTurnTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(final for _, final in emitted), "no final frame after interrupt")
 
 
+class RagTtfbTimingsTest(unittest.IsolatedAsyncioTestCase):
+    """`ttfb_out` sink surfaces into `TurnTimings.rag_ttfb_ms` without changing
+    `rag_ms` semantics or the streaming path."""
+
+    def setUp(self):
+        self.stt = StubSttBackend("hello james")
+        self.vad = StubVadBackend(threshold=0.0)
+
+    async def _run(self, ttfb_out):
+        s, tid = collecting()
+        frames: list = []
+
+        async def emit(pcm, final):
+            frames.append((pcm, final))
+
+        result, timings = await run_turn(
+            state=s, turn_id=tid, audio=b"\x10\x00" * 800,
+            cancelled=asyncio.Event(), stt=self.stt, stt_config=SttConfig(),
+            vad=self.vad, vad_threshold=0.5, rag_ask=lambda q: None,
+            rag_stream=lambda q: stream_of(["Hi there."]),
+            tts=StubTtsBackend(), tts_config=TtsConfig(),
+            emit_audio_frame=emit, now_ms=lambda: 1000, ttfb_out=ttfb_out,
+        )
+        return result, timings, frames
+
+    async def test_ttfb_populated_from_sink(self):
+        _result, timings, _frames = await self._run({"ms": 123})
+        self.assertEqual(timings.rag_ttfb_ms, 123)
+        # Existing rag_ms semantics unchanged (still measured, non-negative).
+        self.assertGreaterEqual(timings.rag_ms, 0)
+
+    async def test_ttfb_zero_when_no_sink(self):
+        _result, timings, _frames = await self._run(None)
+        self.assertEqual(timings.rag_ttfb_ms, 0)
+
+    async def test_ttfb_zero_when_no_body_byte_arrived(self):
+        _result, timings, _frames = await self._run({})  # client never reported
+        self.assertEqual(timings.rag_ttfb_ms, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

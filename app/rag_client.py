@@ -7,7 +7,9 @@ when building the real client).
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 
 class RagError(Exception):
@@ -197,6 +199,7 @@ async def iter_answer(
     max_answer_chars: int = 4000,
     should_stop=None,
     mode: str | None = None,
+    on_ttfb: "Callable[[int], None] | None" = None,
 ):
     """Stream answer text from the portfolio RAG as it arrives.
 
@@ -233,6 +236,12 @@ async def iter_answer(
         )
     except Exception as exc:
         raise RagError("transport", f"RAG request failed: {type(exc).__name__}")
+    # TTFB: measured from immediately before the outbound request is sent to the
+    # first response-BODY chunk (headers alone do not count; response headers are
+    # delivered by ``__aenter__`` below, before any body is read). Reported once,
+    # only if a body chunk actually arrives — never fabricated on failure.
+    ttfb_start = time.monotonic()
+    ttfb_reported = False
     # Only network acquisition/reads are wrapped as transport failures; the
     # yields below sit outside those handlers so an exception raised by the
     # consumer (e.g. a TTS failure) is never reclassified as a RAG error.
@@ -256,6 +265,15 @@ async def iter_answer(
                 break
             except Exception as exc:
                 raise RagError("transport", f"RAG request failed: {type(exc).__name__}")
+            if not ttfb_reported:
+                # First response-body chunk is now in hand → request-to-first-
+                # body-byte duration. Reported exactly once per request.
+                ttfb_reported = True
+                if on_ttfb is not None:
+                    try:
+                        on_ttfb(int((time.monotonic() - ttfb_start) * 1000))
+                    except Exception:
+                        pass  # telemetry must never affect streaming
             for ev in parser.feed(text):
                 if await stopped():
                     stopped_early = True

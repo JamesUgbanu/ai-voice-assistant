@@ -92,6 +92,29 @@ On the portfolio side (Vercel project settings): set `RAG_SERVICE_TOKEN`
 to the same value. No portfolio redeploy of code is needed beyond the
 bearer-auth change, which ships with the normal site deploy.
 
+### Enabling the cloned voice (opt-in, separately reversible)
+
+By default `VOICE_TTS_MODE=preset` speaks the built-in Pocket TTS voice
+(`VOICE_TTS_PRESET_VOICE`, default `alba`) — a natural voice, but **not** the
+cloned voice. To use the authorized reference on the host:
+
+1. Copy the prepared reference (from `scripts/prepare-voice-reference.py`)
+   to `./voice-reference/processed/voice-ref.wav` next to `docker-compose.yml`.
+   It is Git-ignored and never baked into the image; the base compose mounts
+   that directory read-only at `/srv/voice/voice-reference/processed`.
+2. In `.env` set `VOICE_TTS_MODE=clone`,
+   `VOICE_TTS_VOICE_REF=/srv/voice/voice-reference/processed/voice-ref.wav`,
+   and `HF_TOKEN=<gated kyutai/pocket-tts token>`.
+3. `docker compose up -d` (recreate) and verify mode:
+   `curl -fsS http://127.0.0.1:8000/healthz | python3 -m json.tool` — expect
+   `"tts": {"mode": "clone", "ref_configured": true, "cloning_active": true}`.
+   If `cloning_active` is false, the clone weights/terms are not loaded or the
+   reference file is missing; the adapter raises rather than substituting a
+   generic voice (see `docs/P2F-NIGERIAN-ACCENT-REPORT.md` for the measured
+   fidelity limit of this model).
+4. Rollback: set `VOICE_TTS_MODE=preset` (or unset it) and recreate — no code
+   change. This is independent of streaming STT (`VOICE_STT_STREAMING`).
+
 ## 3. Deploy
 
 ```bash

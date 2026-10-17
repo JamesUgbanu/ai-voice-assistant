@@ -62,6 +62,21 @@ class Settings:
         self.stt_hotwords: str = get("VOICE_STT_HOTWORDS")
         self.stt_temperature: float = _getfloat(src, "VOICE_STT_TEMPERATURE", 0.0, 0.0, 1.0)
         self.stt_condition_previous: bool = get("VOICE_STT_CONDITION_PREVIOUS", "").strip().lower() in ("1", "true", "yes")
+        # Incremental (rolling-window) transcription while the user is
+        # speaking (see app/partial_stt.py + docs/STREAMING-STT-REPORT.md).
+        # faster-whisper is a batch decoder, so this re-decodes the accumulated
+        # utterance window on a debounce and emits replaceable
+        # `transcript_partial` events; the final transcript is unchanged.
+        # Set VOICE_STT_STREAMING=0 to restore the previous behavior exactly.
+        self.stt_streaming: bool = get("VOICE_STT_STREAMING", "1").strip().lower() in ("1", "true", "yes")
+        # Minimum wall-clock gap between partial decodes (debounce).
+        self.stt_partial_interval_ms: int = _getint(src, "VOICE_STT_PARTIAL_INTERVAL_MS", 900, 200, 10000)
+        # Minimum audio before the first partial (and minimum growth between
+        # partials) — avoids decoding sub-word fragments.
+        self.stt_partial_min_audio_ms: int = _getint(src, "VOICE_STT_PARTIAL_MIN_AUDIO_MS", 700, 200, 10000)
+        # Stop starting new partials once the utterance window exceeds this;
+        # the final decode still uses the whole buffer. Bounds O(n^2) cost.
+        self.stt_partial_max_audio_seconds: int = _getint(src, "VOICE_STT_PARTIAL_MAX_AUDIO_SECONDS", 15, 2, 55)
         self.vad_source: str = get("VOICE_VAD_SOURCE", "snakers4/silero-vad")
         self.tts_voice_ref: str = get("VOICE_TTS_VOICE_REF")
         self.tts_language: str = get("VOICE_TTS_LANGUAGE", "english")
@@ -74,6 +89,11 @@ class Settings:
         # speaking partial text. Lower = faster first audio, more chunk
         # overhead; higher = fewer, longer chunks.
         self.tts_max_wait_ms: int = _getint(src, "VOICE_TTS_MAX_WAIT_MS", 1200, 100, 10000)
+        # Shorter wait before the FIRST spoken segment so the assistant starts
+        # talking sooner after the RAG stream's first token (the measured
+        # first-audio delay); subsequent segments keep `VOICE_TTS_MAX_WAIT_MS`
+        # so they stay natural and sentence-sized.
+        self.tts_first_max_wait_ms: int = _getint(src, "VOICE_TTS_FIRST_MAX_WAIT_MS", 600, 100, 10000)
         self.tts_clause_trigger_chars: int = _getint(src, "VOICE_TTS_CLAUSE_TRIGGER_CHARS", 80, 8, 2000)
         self.tts_max_chars: int = _getint(src, "VOICE_TTS_MAX_CHARS", 400, 40, 3000)
         self.tts_min_chars: int = _getint(src, "VOICE_TTS_MIN_CHARS", 12, 1, 400)
@@ -97,6 +117,15 @@ class Settings:
         self.sample_rate: int = 16000
         self.session_ticket_ttl_seconds: int = 120
         self.rag_timeout_seconds: int = _getint(src, "VOICE_RAG_TIMEOUT_SECONDS", 25, 5, 120)
+        # Automatic call termination when the conversation has clearly ended.
+        # Only explicit, high-confidence closings ("goodbye", "that's all", …)
+        # qualify; ambiguous/empty/ordinary turns never terminate.
+        self.end_call_confidence: float = _getfloat(src, "VOICE_END_CALL_CONFIDENCE", 0.8, 0.5, 1.0)
+        self.end_call_closing: str = get("VOICE_END_CALL_CLOSING", "Thanks for your time. Goodbye!")
+        # Bounded wait for the client to confirm the closing audio finished
+        # playing before the server terminates; on timeout it terminates anyway
+        # (never leaves the call open indefinitely).
+        self.playback_timeout_ms: int = _getint(src, "VOICE_PLAYBACK_TIMEOUT_MS", 15000, 2000, 60000)
         self.db_path: str = get("VOICE_DB_PATH", "data/voice.sqlite3")
         self.public_base_url: str = get("VOICE_PUBLIC_BASE_URL").rstrip("/")
         # Explicit browser origins (comma-separated). No wildcard: cookies

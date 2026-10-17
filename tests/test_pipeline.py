@@ -75,6 +75,59 @@ class RunTurnTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.frames, [])
         self.assertEqual(s.state, "idle")
 
+    async def test_session_usable_after_a_silence_utterance(self):
+        """Silence must not poison the session: no STT/RAG/audio, back to idle,
+        and the very next valid utterance on the same session still works."""
+        s, tid = collecting()
+        r1, _ = await self._run(s, tid, b"\x00" * 1600)
+        self.assertEqual(r1.transcript, "")
+        self.assertEqual(r1.audio_frames, 0)
+        self.assertEqual(self.stt.calls, [])  # silence never reached STT
+        self.assertEqual(s.state, "idle")
+        # Same session, next turn: begin fresh and run real audio.
+        s.begin_turn()
+        r2, _ = await self._run(s, s.turn_id, b"\x10\x00" * 800)
+        self.assertFalse(r2.cancelled)
+        self.assertEqual(r2.transcript, "hello james")
+        self.assertEqual(len(self.stt.calls), 1)
+        self.assertTrue(self.frames and self.frames[-1][1] is True)
+
+    async def test_confident_misrecognition_is_forwarded_verbatim(self):
+        """A fluent but wrong transcript (dropped "not"; misheard technical
+        name) carries no detectable signal, so the pipeline must NOT silently
+        rewrite or substitute it, and must never fabricate an answer. The
+        transcript reaches RAG exactly as STT produced it, and only the
+        grounded answer is spoken."""
+        from app.stt import SttBackend, Transcript
+
+        for wrong in (
+            "I did configure the production database",   # "not" dropped
+            "Tell me about AWS Lander",                   # Lambda misheard
+            "Do you have fifty years of experience",      # 15 -> 50
+        ):
+            class Wrong(SttBackend):
+                def __init__(self, text):
+                    self.text = text
+
+                def transcribe(self, audio, config):
+                    return Transcript(text=self.text, confidence=0.9, avg_logprob=-0.2)
+
+            seen = []
+            self.frames = []
+
+            async def rag_ask(text):
+                seen.append(text)
+                return "Grounded, evidence-based answer."
+
+            s, tid = collecting()
+            r, _ = await self._run(s, tid, b"\x10\x00" * 800, stt=Wrong(wrong), rag_ask=rag_ask)
+            # Verbatim: not corrected, not replaced, no stale substitution.
+            self.assertEqual(seen, [wrong])
+            self.assertEqual(r.transcript, wrong)
+            # Only the grounded answer is spoken; nothing invented.
+            self.assertEqual(r.answer_text, "Grounded, evidence-based answer.")
+            self.assertTrue(self.frames and self.frames[-1][1] is True)
+
     async def test_diag_capture_writes_whisper_input(self):
         import asyncio
         import json
@@ -266,6 +319,104 @@ class RunTurnTest(unittest.IsolatedAsyncioTestCase):
         s, tid = collecting()
         await self._run(s, tid, b"\x10\x00" * 800, stt=Silent(), on_transcript=seen.append)
         self.assertEqual(seen, [])
+
+
+class ReuseTranscriptTest(unittest.IsolatedAsyncioTestCase):
+    """The incremental path's exact-reuse contract: a decode the caller holds
+    for byte-identical audio replaces the final STT — no extra call, same
+    result, transcript still emitted exactly once."""
+
+    def setUp(self):
+        self.stt = StubSttBackend("fresh decode")
+        self.tts = StubTtsBackend()
+        self.vad = StubVadBackend(threshold=0.0)
+        self.frames: list = []
+
+    async def _emit(self, pcm, final):
+        self.frames.append((pcm, final))
+
+    async def _run(self, state, tid, **kw):
+        return await run_turn(
+            state=state, turn_id=tid, audio=b"\x10\x00" * 800,
+            cancelled=asyncio.Event(), stt=self.stt, stt_config=SttConfig(),
+            vad=self.vad, vad_threshold=0.5,
+            rag_ask=kw.get("rag_ask", _ok_rag), tts=self.tts,
+            tts_config=TtsConfig(), emit_audio_frame=self._emit,
+            now_ms=lambda: 1000, on_transcript=kw.get("on_transcript"),
+            fast_reply=kw.get("fast_reply"), rag_stream=kw.get("rag_stream"),
+            preexisting_transcript=kw.get("preexisting"),
+        )
+
+    async def test_reused_transcript_skips_final_stt(self):
+        from app.stt import Transcript
+
+        s, tid = collecting()
+        seen = []
+        result, timings = await self._run(
+            s, tid, preexisting=Transcript(text="words 2", confidence=0.9, avg_logprob=-0.2),
+            on_transcript=seen.append,
+        )
+        self.assertEqual(self.stt.calls, [])  # final STT skipped
+        self.assertTrue(timings.stt_reused)
+        self.assertEqual(result.transcript, "words 2")
+        self.assertEqual(seen, ["words 2"])  # emitted exactly once
+        self.assertTrue(self.frames and self.frames[-1][1] is True)
+
+    async def test_reuse_preserves_greeting_confidence(self):
+        from app.stt import Transcript
+
+        captured: dict = {}
+
+        def fast_reply(text, obj):
+            captured["logprob"] = getattr(obj, "avg_logprob", None)
+            return "Hi there."
+
+        async def never_stream(_q):
+            if False:
+                yield ""
+
+        s, tid = collecting()
+        result, _ = await self._run(
+            s, tid, preexisting=Transcript(text="Hello.", confidence=1.0, avg_logprob=-0.1),
+            fast_reply=fast_reply, rag_stream=never_stream,
+        )
+        # The reuse must carry the decode's confidence, not lose it — the
+        # greeting fast path is confidence-gated.
+        self.assertEqual(captured["logprob"], -0.1)
+        self.assertTrue(result.fast_path)
+        self.assertEqual(self.stt.calls, [])
+
+    async def test_empty_preexisting_falls_back_to_stt(self):
+        from app.stt import Transcript
+
+        s, tid = collecting()
+        result, timings = await self._run(s, tid, preexisting=Transcript(text="   "))
+        self.assertEqual(len(self.stt.calls), 1)  # real decode runs
+        self.assertFalse(timings.stt_reused)
+        self.assertEqual(result.transcript, "fresh decode")
+
+    async def test_reuse_still_makes_one_rag_request(self):
+        from app.stt import Transcript
+
+        calls: list = []
+
+        async def rag_stream(text):
+            calls.append(text)
+            yield "Grounded answer."
+
+        state = TurnState()
+        tid = state.begin_turn()
+        result, _ = await run_turn(
+            state=state, turn_id=tid, audio=b"\x10\x00" * 800,
+            cancelled=asyncio.Event(), stt=self.stt, stt_config=SttConfig(),
+            vad=self.vad, vad_threshold=0.5, rag_ask=lambda q: None,
+            rag_stream=rag_stream, tts=self.tts, tts_config=TtsConfig(),
+            emit_audio_frame=self._emit, now_ms=lambda: 1000,
+            preexisting_transcript=Transcript(text="words 2"),
+        )
+        self.assertEqual(calls, ["words 2"])
+        self.assertIsNone(result.error)
+        self.assertTrue(self.frames[-1][1] is True)
 
 
 async def _ok_rag(text: str) -> str:
