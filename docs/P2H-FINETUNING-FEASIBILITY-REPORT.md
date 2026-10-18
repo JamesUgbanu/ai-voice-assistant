@@ -83,7 +83,7 @@ Documented minimums (training/README.md): "100 hours is a minimum" / "aim for
 Training also requires **word alignments** (forced alignment, Wav2Vec2 CTC) and
 clean ~30 s max segments.
 
-`Alimosho.m4a` = **99.1 s ≈ 0.0275 h** — roughly **3,600× short of the 100 h
+`<private-reference-recording>.m4a` = **99.1 s ≈ 0.0275 h** — roughly **3,600× short of the 100 h
 minimum**, and it is sparse (~50 % speech; P2F). There is **no documented method
 that adapts this architecture from 99 s.** Single-speaker fine-tuning of a
 100 M+ flow-matching LM on 99 s would overfit/catastrophically forget, and no LoRA

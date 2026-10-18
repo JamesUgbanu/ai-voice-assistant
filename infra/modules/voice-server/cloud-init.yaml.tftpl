@@ -1,0 +1,104 @@
+#cloud-config
+# ---------------------------------------------------------------------------
+# Voice-service host bootstrap (provider-neutral).
+#
+# Produces: Docker engine + compose plugin, a non-root deploy user, the
+# application directory, optional swap, optional ufw, and SSH hardening.
+#
+# Contains NO secrets. The application .env (RAG token, HMAC secret, HF token)
+# is delivered later, over SSH, by infra/scripts/deploy.sh. This file is safe to
+# pass to any provider as user-data (cloud-init).
+# ---------------------------------------------------------------------------
+hostname: ${name}
+preserve_hostname: false
+manage_etc_hosts: true
+
+package_update: true
+package_upgrade: false
+package_reboot_if_required: false
+
+packages:
+  - ca-certificates
+  - curl
+  - rsync
+  - git
+  - util-linux
+  - docker.io
+%{ if enable_host_firewall ~}
+  - ufw
+%{ endif ~}
+%{ for pkg in extra_packages ~}
+  - ${pkg}
+%{ endfor ~}
+
+users:
+  - name: ${deploy_user}
+    shell: /bin/bash
+    lock_passwd: true
+%{ if length(ssh_authorized_keys) > 0 ~}
+    ssh_authorized_keys:
+%{ for key in ssh_authorized_keys ~}
+      - ${key}
+%{ endfor ~}
+%{ endif ~}
+
+write_files:
+  - path: /etc/docker/daemon.json
+    permissions: "0644"
+    owner: "root:root"
+    content: |
+      {
+        "log-driver": "json-file",
+        "log-opts": { "max-size": "10m", "max-file": "3" },
+        "live-restore": true
+      }
+  - path: /var/lib/voice-bootstrap.env
+    permissions: "0644"
+    owner: "root:root"
+    content: |
+      VOICE_APP_DIR=${app_dir}
+      VOICE_DEPLOY_USER=${deploy_user}
+      VOICE_APP_HOSTNAME=${app_hostname}
+      VOICE_ENVIRONMENT=${environment}
+%{ if enable_ssh_hardening ~}
+  - path: /etc/ssh/sshd_config.d/99-voice-hardening.conf
+    permissions: "0644"
+    owner: "root:root"
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin prohibit-password
+      X11Forwarding no
+%{ endif ~}
+
+runcmd:
+  - [systemctl, enable, --now, docker]
+  # Compose plugin: distro package first, official binary as a fallback.
+  - bash -c 'if ! docker compose version >/dev/null 2>&1; then (DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-v2 || DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-plugin || { mkdir -p /usr/libexec/docker/cli-plugins; curl -fsSL "https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-$(uname -m)" -o /usr/libexec/docker/cli-plugins/docker-compose; chmod +x /usr/libexec/docker/cli-plugins/docker-compose; }); fi'
+  - [usermod, -aG, docker, "${deploy_user}"]
+  - [install, -d, -o, "${deploy_user}", -g, "${deploy_user}", -m, "0750", "${app_dir}"]
+  - [install, -d, -o, "${deploy_user}", -g, "${deploy_user}", -m, "0750", "${app_dir}/voice-reference/processed"]
+  # If the provider did not install a key for the deploy user, reuse root's keys.
+  - bash -c 'if [ ! -s /home/${deploy_user}/.ssh/authorized_keys ] && [ -s /root/.ssh/authorized_keys ]; then install -d -m 700 -o ${deploy_user} -g ${deploy_user} /home/${deploy_user}/.ssh; cp /root/.ssh/authorized_keys /home/${deploy_user}/.ssh/authorized_keys; chown ${deploy_user}:${deploy_user} /home/${deploy_user}/.ssh/authorized_keys; chmod 600 /home/${deploy_user}/.ssh/authorized_keys; fi'
+%{ if swap_size_mb > 0 ~}
+  # Swap as OOM headroom on small hosts (see README "Server sizing").
+  - bash -c 'if [ ! -f /swapfile ]; then (fallocate -l ${swap_size_mb}M /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=${swap_size_mb}); chmod 600 /swapfile; mkswap /swapfile; swapon /swapfile; grep -q "^/swapfile" /etc/fstab || echo "/swapfile none swap sw 0 0" >> /etc/fstab; fi'
+  - [sysctl, -w, vm.swappiness=10]
+%{ endif ~}
+%{ if enable_host_firewall ~}
+  # Defense-in-depth only. The provider firewall is the primary control;
+  # note Docker publishes bypass ufw's INPUT chain. See README.
+  - [ufw, default, deny, incoming]
+  - [ufw, default, allow, outgoing]
+%{ for cidr in ssh_allowed_cidrs ~}
+  - [ufw, allow, from, "${cidr}", to, any, port, "${ssh_port}", proto, tcp]
+%{ endfor ~}
+%{ for p in public_web_ports ~}
+  - [ufw, allow, "${p}/tcp"]
+%{ endfor ~}
+  - [ufw, --force, enable]
+%{ endif ~}
+%{ if enable_ssh_hardening ~}
+  - [systemctl, restart, ssh]
+%{ endif ~}
+  - bash -c 'touch /var/lib/voice-bootstrap-complete'

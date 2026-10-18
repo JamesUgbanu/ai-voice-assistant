@@ -42,7 +42,7 @@ Segmental accent (vowel/consonant quality) is **NOT TESTED** (needs listening).
 
 ## 3. Reference recording inspection
 
-- Original `Alimosho.m4a`: AAC, 16 kHz mono, **99.1 s**, ~**50 % speech**
+- Original `<private-reference-recording>.m4a`: AAC, 16 kHz mono, **99.1 s**, ~**50 % speech**
   (many pauses; the first 1.9 s are silence).
 - Current processed ref (first 30 s): mono 24 kHz PCM16, **47 % speech**, many
   short pauses, 1.9 s silent lead.
@@ -151,7 +151,7 @@ open voice-reference/output/accent-current.wav   # current clone
 open voice-reference/output/accent-ref10.wav     # densest 10 s ref
 open voice-reference/output/accent-ref30.wav     # densest 30 s ref
 open voice-reference/output/accent-preset.wav    # non-cloned baseline
-open voice-reference/original/Alimosho.m4a       # your original
+open voice-reference/original/<private-reference-recording>.m4a       # your original
 ```
 
 If `accent-ref10/30` sound no more Nigerian than `accent-current` (as the

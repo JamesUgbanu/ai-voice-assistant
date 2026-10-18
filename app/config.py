@@ -103,6 +103,13 @@ class Settings:
         self.transcribe_per_minute: int = _getint(src, "VOICE_TRANSCRIBE_PER_MINUTE", 20, 1, 600)
         self.transcribe_ticket_per_minute: int = _getint(src, "VOICE_TRANSCRIBE_TICKET_PER_MINUTE", 30, 1, 600)
         self.transcribe_ticket_ttl_seconds: int = _getint(src, "VOICE_TRANSCRIBE_TICKET_TTL_SECONDS", 300, 30, 3600)
+        # "Listen to response": synthesize an existing chat answer without
+        # consuming a voice session or running RAG again. Tickets are minted
+        # per browser origin and every request is bounded by text length.
+        self.tts_listen_max_chars: int = _getint(src, "VOICE_TTS_LISTEN_MAX_CHARS", 2000, 100, 3000)
+        self.tts_per_minute: int = _getint(src, "VOICE_TTS_PER_MINUTE", 12, 1, 600)
+        self.tts_ticket_per_minute: int = _getint(src, "VOICE_TTS_TICKET_PER_MINUTE", 20, 1, 600)
+        self.tts_ticket_ttl_seconds: int = _getint(src, "VOICE_TTS_TICKET_TTL_SECONDS", 300, 30, 3600)
 
         self.max_call_seconds: int = _getint(src, "VOICE_MAX_CALL_SECONDS", 300, 60, 3600)
         self.daily_allowance_seconds: int = _getint(src, "VOICE_DAILY_ALLOWANCE_SECONDS", 600, 60, 86400)
@@ -117,6 +124,14 @@ class Settings:
         self.sample_rate: int = 16000
         self.session_ticket_ttl_seconds: int = 120
         self.rag_timeout_seconds: int = _getint(src, "VOICE_RAG_TIMEOUT_SECONDS", 25, 5, 120)
+        # Voice booking uses the portfolio's shared deterministic booking API.
+        # Derive the default from the verified RAG endpoint; never guess a host.
+        _rag = self.rag_api_url.rstrip("/")
+        self.booking_api_url: str = get("VOICE_BOOKING_API_URL") or (
+            _rag[: -len("/api/rag")] + "/api/booking" if _rag.endswith("/api/rag") else ""
+        )
+        self.booking_timezone: str = get("VOICE_BOOKING_TIMEZONE", "Africa/Lagos")
+        self.booking_timeout_seconds: int = _getint(src, "VOICE_BOOKING_TIMEOUT_SECONDS", 20, 5, 60)
         # Automatic call termination when the conversation has clearly ended.
         # Only explicit, high-confidence closings ("goodbye", "that's all", …)
         # qualify; ambiguous/empty/ordinary turns never terminate.

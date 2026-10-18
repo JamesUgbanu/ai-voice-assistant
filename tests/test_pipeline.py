@@ -60,6 +60,31 @@ class RunTurnTest(unittest.IsolatedAsyncioTestCase):
         # latency on the slowest stage for zero benefit.
         self.assertEqual(len(self.stt.calls), 1)
 
+    async def test_typed_text_uses_same_rag_tts_without_stt_or_vad(self):
+        calls = []
+        seen = []
+        s, tid = collecting()
+
+        async def rag_ask(text):
+            calls.append(text)
+            return "Typed answer."
+
+        result, timings = await run_turn(
+            state=s, turn_id=tid, audio=b"", cancelled=asyncio.Event(),
+            stt=self.stt, stt_config=self.stt_config, vad=self.vad,
+            vad_threshold=0.5, rag_ask=rag_ask, tts=self.tts,
+            tts_config=self.tts_config, emit_audio_frame=self._emit,
+            on_transcript=lambda text: seen.append(text),
+            text_input="I prefer to type this",
+        )
+        self.assertEqual(self.stt.calls, [])
+        self.assertEqual(calls, ["I prefer to type this"])
+        self.assertEqual(result.transcript, "I prefer to type this")
+        self.assertEqual(result.answer_text, "Typed answer.")
+        self.assertEqual(seen, ["I prefer to type this"])
+        self.assertTrue(self.frames and self.frames[-1][1] is True)
+        self.assertEqual(s.state, "idle")
+
     async def test_silence_never_reaches_stt_or_rag(self):
         calls = []
         s, tid = collecting()

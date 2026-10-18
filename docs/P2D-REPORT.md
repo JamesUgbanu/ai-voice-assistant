@@ -123,7 +123,7 @@ the recording is never copied into the image and never served over HTTP.
 
 - **Perceptual similarity: human listening required.** I cannot audition audio.
   Play `voice-reference/output/cloned-voice.wav` next to the original
-  `voice-reference/original/Alimosho.m4a` and `preset-voice.wav`.
+  `voice-reference/original/<private-reference-recording>.m4a` and `preset-voice.wav`.
 - **Latency**: RTF > 1 on this contended 2-vCPU Intel host — not real-time here
   (unchanged from P2A/P2B). Re-measure on the target CPU.
 - The cloned voice will sound best if the 30 s reference is clean, continuous
@@ -138,7 +138,7 @@ the recording is never copied into the image and never served over HTTP.
 ```bash
 open voice-reference/output/cloned-voice.wav
 open voice-reference/output/preset-voice.wav
-open voice-reference/original/Alimosho.m4a
+open voice-reference/original/<private-reference-recording>.m4a
 ```
 
 If the cloned output is perceptually close, the cloning integration is complete

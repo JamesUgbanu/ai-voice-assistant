@@ -15,16 +15,19 @@ Headers: `Content-Type: application/json`, `Authorization: Bearer <VOICE_RAG_SER
 
 ```json
 {
-  "question": "string, trimmed, 3..500 chars (required)",
+  "question": "string, trimmed, 2..500 chars (portfolio schema; the voice client requires ≥3)",
   "history": [ {"question": "≤500 chars", "answer": "≤2000 chars"} ],  // max 6 turns, optional, default []
   "debug": false,                                                     // optional, default false
-  "sessionId": "opaque string ≤64 chars, optional"
+  "sessionId": "opaque string ≤64 chars, optional",
+  "mode": "voice"                                                    // optional; concise spoken answer + isolated cache
 }
 ```
 
-The voice service sends `{question, history: [], debug: false}` — the
-voice agent holds conversation server-side, so each voice turn is
-self-contained. History is accepted by the schema but unused.
+The voice service sends `{question, history: <last six completed turns>, debug: false, mode: "voice"}`.
+Only completed, uncancelled turns are appended, so retries cannot duplicate
+history. The voice client caps the list at six turns; the portfolio accepts up
+to ten. The portfolio's authenticated service budget is used instead of visitor
+IP/session windows.
 
 ## Response: Server-Sent Events
 
@@ -41,18 +44,25 @@ Event types: `meta` (`{sessionId, route, cached, ...}`), `token`
 ignores these; citations are never spoken), `done` (`{metrics}`),
 `error` (`{message}` — user-safe fallback copy).
 
-Non-2xx statuses: `400` invalid body, `401` bad/missing service token,
-`413` oversized body, `429` service budget exhausted (with `Retry-After`).
+Non-2xx statuses: `400` invalid body, `401` bad service token, `413` oversized
+body, `429` service budget exhausted (with `Retry-After`). The voice client
+passes `VOICE_RAG_TIMEOUT_SECONDS` (default 25 s) as the per-operation timeout,
+aborts on turn cancellation, and maps transport, HTTP, empty, and pipeline
+failures to `turn_end {reason: "rag_failed"}` without fabricating an answer. If
+audio has already started, the pipeline finalizes the partial answer instead of
+failing the whole turn.
 
 ## Authentication (added for server-to-server)
 
 - Browser clients: unchanged, no header, existing IP/session budgets apply.
 - Voice service: `Authorization: Bearer <RAG_SERVICE_TOKEN>` verified with
-  a constant-time compare against server env; wrong/missing token → 401.
-  Authenticated calls use a dedicated service budget instead of the
-  visitor IP/session windows (all voice traffic shares one egress IP),
-  with identical validation, body caps, concurrency slots, contact-action
-  budgets, and telemetry. No secrets in `NEXT_PUBLIC_*` or browser bundles.
+  a constant-time compare against server env; a wrong token → 401. A missing
+  Authorization header is treated as public browser traffic, not as an
+  authenticated service call.
+  Authenticated calls use a dedicated service budget instead of the visitor
+  IP/session windows (all voice traffic shares one egress IP), with identical
+  validation, body caps, concurrency slots, contact-action budgets, and
+  telemetry. No secrets in `NEXT_PUBLIC_*` or browser bundles.
 
 ## Worked example (sanitized)
 
@@ -63,7 +73,7 @@ POST /api/rag HTTP/1.1
 Content-Type: application/json
 Authorization: Bearer <redacted>
 
-{"question": "What has James built with AWS?", "history": [], "debug": false}
+{"question": "What has James built with AWS?", "history": [], "debug": false, "mode": "voice"}
 ```
 
 Stream (abridged):
@@ -86,9 +96,9 @@ data: {"metrics":{"route":"knowledge", ...}}
 ```
 
 The voice client folds `token` frames into one answer string, compacts
-whitespace/markdown, caps at 2800 chars (compact enough for spoken
-delivery and small webhook-style payloads), and treats empty/error streams as a spoken
-apology — never fabricated text.
+whitespace/markdown, caps at 2800 chars (compact enough for spoken delivery and
+small webhook-style payloads), and treats empty/error streams as a failed turn —
+it never fabricates text.
 
 ## What the voice service must never do
 

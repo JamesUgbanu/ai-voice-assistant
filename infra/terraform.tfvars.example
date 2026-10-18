@@ -1,0 +1,69 @@
+# Example Terraform variables for the voice-service infrastructure.
+#
+# Copy to a per-environment file (never committed), fill in placeholders, and
+# pass it with `-var-file`. Do NOT put real secrets in a tracked file.
+#
+#   cp terraform.tfvars.example terraform.tfvars   # then edit; .gitignore excludes *.tfvars
+#   export HCLOUD_TOKEN=...                        # never write the token into a file
+#   terraform plan -var-file=terraform.tfvars
+#
+# Every value below is a placeholder or a documented default.
+
+environment = "production"
+server_name = "james-voice-service"
+
+# Sizing: cpx21 = 3 vCPU (AMD x86_64) / 4 GB. See README.md "Server sizing".
+# Recommended for headroom under CPU-bound TTS: "cpx31" (4 vCPU / 8 GB).
+# The repo's historical 1 vCPU / 2 GB target is NOT approved for traffic.
+server_type      = "cpx21"
+cpu_architecture = "x86_64"
+
+image    = "ubuntu-24.04"
+location = "fsn1"
+
+enable_ipv4 = true
+enable_ipv6 = true
+
+# REQUIRED: lock SSH down to your trusted source addresses.
+ssh_allowed_cidrs = ["203.0.113.4/32"]
+
+# Provide EITHER an existing Hetzner key name...
+# ssh_key_name = "my-existing-key"
+# ...OR the public key content (never a private key). Public keys are not secrets.
+# ssh_public_key = "ssh-ed25519 AAAA...REPLACE... user@laptop"
+
+# Public hostname. Must already resolve to the server before first boot so
+# Caddy can complete the ACME TLS challenge. DNS is a manual prerequisite.
+app_hostname = "voice.jamesugbanu.com"
+
+deploy_user = "deploy"
+app_dir     = "/opt/james-voice-service"
+
+public_web_ports = [80, 443]
+
+# Optional: attached Hetzner volume in GB to persist weights/session state
+# across server replacement. 0 = disabled (weights re-download on a new host).
+# Read README.md "Persistent storage" before enabling.
+data_volume_size_gb = 0
+
+# Optional host-level firewall (defense-in-depth only; provider firewall is
+# primary and Docker bypasses ufw). Read README.md before enabling.
+enable_host_firewall = false
+swap_size_mb         = 2048
+
+labels = {
+  project = "james-voice-service"
+  owner   = "REPLACE-with-owner"
+}
+
+# extra_packages = ["sqlite3"]
+
+# Add only deliberately; anything beyond 80/443 exposes the service.
+# extra_firewall_rules = [
+#   {
+#     description = "example-extra"
+#     protocol    = "tcp"
+#     port        = "8443"
+#     source_ips  = ["203.0.113.4/32"]
+#   },
+# ]

@@ -34,6 +34,110 @@ class TtsConfig:
     sample_rate: int = 24000
 
 
+def _decoded_values(audio):
+    """Flatten model audio to finite floats, or None for legacy fake arrays."""
+    import math
+
+    raw = audio.detach().cpu() if hasattr(audio, "detach") else audio
+    if hasattr(raw, "numpy"):
+        raw = raw.numpy()
+    if not hasattr(raw, "tolist") and not hasattr(raw, "__iter__"):
+        return None
+    values = raw.tolist() if hasattr(raw, "tolist") else list(raw)
+
+    def _flat(items):
+        for item in items:
+            if isinstance(item, (list, tuple)):
+                yield from _flat(item)
+            else:
+                yield item
+
+    return [
+        float(v)
+        for v in _flat(values)
+        if isinstance(v, (int, float)) and math.isfinite(float(v))
+    ]
+
+
+def _pcm16(audio) -> bytes:
+    """Convert model float audio to PCM16 safely.
+
+    The previous direct ``audio * 32767`` cast wrapped samples outside [-1, 1]
+    and was a source of audible crackle. Remove DC, apply bounded peak gain to
+    a safe target, and clip before conversion. The streaming path uses
+    ``Pcm16StreamEncoder`` so gain changes are continuous across chunks.
+    """
+    from array import array
+
+    values = _decoded_values(audio)
+    if values is None:
+        # Compatibility for the unit-suite fake array (no numeric export).
+        raw = audio.detach().cpu() if hasattr(audio, "detach") else audio
+        if hasattr(raw, "numpy"):
+            raw = raw.numpy()
+        return (raw * 32767.0).astype("<i2").tobytes()
+    if not values:
+        return b""
+    mean = sum(values) / len(values)
+    values = [v - mean for v in values]
+    peak = max(abs(v) for v in values)
+    gain = min(0.95 / peak, 10.0) if peak > 0 else 1.0
+    out = array("h")
+    for v in values:
+        sample = max(-1.0, min(1.0, v * gain))
+        out.append(int(round(sample * 32767.0)))
+    return out.tobytes()
+
+
+class Pcm16StreamEncoder:
+    """Stateful float-audio → PCM16 encoder for chunked synthesis.
+
+    Independent per-chunk peak normalization makes gain jump at every chunk
+    boundary (audible pumping). This encoder removes DC per chunk, but keeps
+    gain continuous: loud passages reduce gain immediately to prevent clipping,
+    while quieter passages recover gradually. Samples are clipped before
+    conversion, so model overshoot cannot wrap.
+    """
+
+    def __init__(self, target_peak: float = 0.95, max_gain: float = 10.0) -> None:
+        from array import array
+
+        self._array = array
+        self._target_peak = target_peak
+        self._max_gain = max_gain
+        self._gain: float | None = None
+
+    def encode(self, audio) -> bytes:
+        values = _decoded_values(audio)
+        if values is None:
+            raw = audio.detach().cpu() if hasattr(audio, "detach") else audio
+            if hasattr(raw, "numpy"):
+                raw = raw.numpy()
+            return (raw * 32767.0).astype("<i2").tobytes()
+        if not values:
+            return b""
+
+        mean = sum(values) / len(values)
+        filtered = [v - mean for v in values]
+        peak = max(abs(v) for v in filtered)
+        if peak <= 0:
+            return bytes(len(filtered) * 2)
+        desired = min(self._target_peak / peak, self._max_gain)
+        if self._gain is None or desired < self._gain:
+            # Immediate attack: a newly loud chunk must never clip while the
+            # smoother catches up.
+            self._gain = desired
+        else:
+            # Gradual recovery avoids pumping on quiet tails/chunks.
+            self._gain += 0.5 * (desired - self._gain)
+
+        out = self._array("h")
+        for v in filtered:
+            sample = max(-1.0, min(1.0, v * self._gain))
+            out.append(int(round(sample * 32767.0)))
+        return out.tobytes()
+
+
 class TtsBackend:
     name = "base"
 
@@ -139,8 +243,7 @@ class PocketTtsBackend(TtsBackend):
         with self._lock:
             model, voice_state = self._ensure_locked(config)
             audio = model.generate_audio(voice_state, text)
-            pcm = (audio.numpy() * 32767.0).astype("<i2")
-            return pcm.tobytes()
+            return _pcm16(audio)
 
     def synthesize_stream(self, text: str, config: TtsConfig, stop=None):
         """Stream decoded chunks as Pocket TTS produces them. First audio
@@ -149,9 +252,11 @@ class PocketTtsBackend(TtsBackend):
         100–400 chars). `stop` aborts mid-generation for barge-in."""
         with self._lock:
             model, voice_state = self._ensure_locked(config)
+            encoder = Pcm16StreamEncoder()
             for chunk in model.generate_audio_stream(voice_state, text, stop=stop):
-                arr = chunk.detach().cpu().numpy()
-                yield (arr * 32767.0).astype("<i2").tobytes()
+                pcm = encoder.encode(chunk)
+                if pcm:
+                    yield pcm
 
     def supports_incremental(self) -> bool:
         return True

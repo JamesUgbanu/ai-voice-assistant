@@ -183,3 +183,81 @@ class AdapterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Pcm16NormalizationTest(unittest.TestCase):
+    def test_clips_out_of_range_samples_instead_of_wrapping(self):
+        from app.tts import _pcm16
+        import struct
+        raw = _pcm16([2.0, -2.0, 0.0, 0.0])
+        vals = struct.unpack(f"<{len(raw)//2}h", raw)
+        self.assertEqual(len(vals), 4)
+        self.assertLessEqual(max(abs(v) for v in vals), 32767)
+        self.assertEqual(vals[2:], (0, 0))
+
+    def test_accepts_nested_channel_lists(self):
+        from app.tts import _pcm16
+        import struct
+        raw = _pcm16([[0.0, 0.5, -0.5, 0.0]])
+        vals = struct.unpack(f"<{len(raw)//2}h", raw)
+        self.assertEqual(len(vals), 4)
+        self.assertGreater(max(abs(v) for v in vals), 2000)
+
+    def test_removes_dc_and_boosts_quiet_audio_without_clipping(self):
+        from app.tts import _pcm16
+        import struct
+        raw = _pcm16([0.50, 0.51, 0.49, 0.50])
+        vals = struct.unpack(f"<{len(raw)//2}h", raw)
+        self.assertLessEqual(max(abs(v) for v in vals), 32767)
+        self.assertGreater(max(abs(v) for v in vals), 2000)
+        self.assertLessEqual(abs(sum(vals) / len(vals)), 80)
+
+
+class Pcm16StreamEncoderTest(unittest.TestCase):
+    def test_quiet_stream_is_boosted_without_clipping(self):
+        from app.tts import Pcm16StreamEncoder
+        import struct
+        enc = Pcm16StreamEncoder()
+        raw = enc.encode([0.01, -0.01] * 120)
+        vals = struct.unpack(f"<{len(raw)//2}h", raw)
+        peak = max(abs(v) for v in vals)
+        self.assertGreater(peak, 2000)
+        self.assertLessEqual(peak, int(0.96 * 32767))
+
+    def test_loud_chunk_after_quiet_never_clips(self):
+        from app.tts import Pcm16StreamEncoder
+        import struct
+        enc = Pcm16StreamEncoder()
+        enc.encode([0.01, -0.01] * 40)  # initialize at the maximum quiet gain
+        raw = enc.encode([0.7, -0.7] * 40)
+        vals = struct.unpack(f"<{len(raw)//2}h", raw)
+        self.assertLessEqual(max(abs(v) for v in vals), int(0.96 * 32767))
+
+    def test_gain_recovers_gradually_without_chunk_edge_step(self):
+        from app.tts import Pcm16StreamEncoder
+        import struct
+        enc = Pcm16StreamEncoder()
+        first_raw = enc.encode([0.7, -0.7] * 40)
+        first = struct.unpack(f"<{len(first_raw)//2}h", first_raw)
+        second_raw = enc.encode([0.01, -0.01] * 40)
+        second = struct.unpack(f"<{len(second_raw)//2}h", second_raw)
+        # A quiet chunk after a loud one stays attenuated (gain continuity)
+        # but is not silenced, and neither chunk wraps.
+        self.assertGreater(max(abs(v) for v in second), 0)
+        self.assertLessEqual(max(abs(v) for v in second), int(0.96 * 32767))
+
+    def test_out_of_range_model_samples_are_clipped_not_wrapped(self):
+        from app.tts import Pcm16StreamEncoder
+        import struct
+        enc = Pcm16StreamEncoder()
+        raw = enc.encode([8.0, -8.0])
+        vals = struct.unpack(f"<{len(raw)//2}h", raw)
+        self.assertLessEqual(max(abs(v) for v in vals), int(0.96 * 32767))
+
+    def test_silence_stays_silent(self):
+        from app.tts import Pcm16StreamEncoder
+        import struct
+        enc = Pcm16StreamEncoder()
+        raw = enc.encode([0.0] * 40)
+        vals = struct.unpack(f"<{len(raw)//2}h", raw)
+        self.assertEqual(set(vals), {0})

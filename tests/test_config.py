@@ -67,6 +67,12 @@ class ConfigTest(unittest.TestCase):
         self.assertTrue(Settings(env={"VOICE_RAG_API_URL": "https://x",
                                        "VOICE_RAG_SERVICE_TOKEN": "t"}).rag_configured)
 
+    def test_tts_listen_defaults_and_bounds(self):
+        self.assertEqual(Settings(env={}).tts_listen_max_chars, 2000)
+        self.assertEqual(Settings(env={"VOICE_TTS_LISTEN_MAX_CHARS": "50"}).tts_listen_max_chars, 100)
+        self.assertEqual(Settings(env={"VOICE_TTS_LISTEN_MAX_CHARS": "99999"}).tts_listen_max_chars, 3000)
+        self.assertEqual(Settings(env={}).tts_per_minute, 12)
+
 
 if __name__ == "__main__":
     unittest.main()

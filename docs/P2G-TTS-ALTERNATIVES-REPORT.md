@@ -81,7 +81,7 @@ Audio paths (all Git-ignored, private):
 voice-reference/output/p2g-naija-male.wav    # Uphando Nigerian-accent VITS (16 kHz)
 voice-reference/output/accent-current.wav    # Pocket clone, same passage (P2F)
 voice-reference/output/accent-preset.wav     # Pocket preset baseline (P2F)
-voice-reference/original/Alimosho.m4a        # your recording
+voice-reference/original/<private-reference-recording>.m4a        # your recording
 ```
 
 Objective content check: Whisper transcribes `p2g-naija-male.wav` to the passage
@@ -113,7 +113,7 @@ naturalness must be judged by ear. Listen to:
 ```bash
 open voice-reference/output/p2g-naija-male.wav   # clearly Nigerian-accent voice (not James)
 open voice-reference/output/accent-current.wav   # James's cloned voice (neutralised accent)
-open voice-reference/original/Alimosho.m4a
+open voice-reference/original/<private-reference-recording>.m4a
 ```
 
 The question to answer: is a **Nigerian-accented voice that is not James** better

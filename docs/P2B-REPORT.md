@@ -167,14 +167,15 @@ Interruption→stop latency **0.02 s = PASS**.
 ## 9. Exact local startup (secrets redacted)
 
 ```bash
+# Set VOICE_REPO and PORTFOLIO_REPO to your local checkouts.
 # 1) Portfolio (host) — enables the voice UI; text chat is unaffected.
-cd "/Users/user/Desktop/iDENVA/Personal website"
+cd "$PORTFOLIO_REPO"
 NEXT_PUBLIC_VOICE_ENABLED=1 \
 NEXT_PUBLIC_VOICE_BASE_URL=http://localhost:8000 \
 npm run dev                       # http://localhost:3000
 
 # 2) Voice service (Docker) — base + local overlay gives host-gateway + port.
-cd "/Users/user/Desktop/iDENVA/james-voice-service"
+cd "$VOICE_REPO"
 # .env (gitignored) must define, with the portfolio's values:
 #   VOICE_RAG_API_URL=http://host.docker.internal:3000/api/rag
 #   VOICE_RAG_SERVICE_TOKEN=<same as portfolio RAG_SERVICE_TOKEN>
@@ -185,7 +186,7 @@ docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build v
 curl -s http://localhost:8000/healthz   # {"status":"ok","db":true}
 
 # 3) Reproduce the browser E2E (needs Chromium via pwtest-local + ffmpeg/say)
-cd "/Users/user/Desktop/iDENVA/Personal website/pwtest-local"
+cd "$PORTFOLIO_REPO/pwtest-local"
 HEADED=1 node browser-conversations.mjs
 ```
 

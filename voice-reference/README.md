@@ -5,8 +5,11 @@ voice cloning and the normalized working copy derived from it.
 
 **Everything here except this README is Git-ignored** (see `.gitignore`).
 Never commit a personal recording, an exported voice embedding, or generated
-audio. Never copy these files into the portfolio repository, the Docker image,
-or any public/static asset location, and never upload them to a third party.
+audio. Never copy the source/processed recordings into the portfolio
+repository, public/static assets, or an image. The separate production image
+intentionally bakes only the normalized authorized reference from
+`deploy/reference/` (Option A); do not mount it over the image or publish it.
+Never upload any of these files to a third party.
 
 ## Layout
 

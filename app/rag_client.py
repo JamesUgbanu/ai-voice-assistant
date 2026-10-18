@@ -126,7 +126,7 @@ def parse_sse_events(body: str) -> dict:
     return {"answer": "".join(answer_parts), "route": route, "cached": cached, "sources": sources, "error": error}
 
 
-def build_rag_body(question: str, history: list | None = None, mode: str | None = None) -> dict:
+def build_rag_body(question: str, history: list | None = None, mode: str | None = None, time_zone: str | None = None) -> dict:
     """Request payload honoring the portfolio schema (question 3..500 chars,
     history capped at 6 turns). `mode="voice"` asks the portfolio for a
     concise spoken answer and isolates its cache; omitted keeps website
@@ -145,6 +145,8 @@ def build_rag_body(question: str, history: list | None = None, mode: str | None 
     body = {"question": q[:500], "history": clean_history, "debug": False}
     if mode:
         body["mode"] = mode
+    if time_zone:
+        body["timeZone"] = time_zone
     return body
 
 
@@ -156,6 +158,7 @@ async def fetch_answer(
     history: list | None = None,
     timeout_seconds: float = 25.0,
     max_answer_chars: int = 4000,
+    time_zone: str | None = None,
 ) -> RagAnswer:
     """POST one question to the portfolio RAG and fold the SSE stream.
     `client` is an httpx-like object with .post(); tests inject fakes.
@@ -163,7 +166,7 @@ async def fetch_answer(
     fabricated text (callers fall back to a spoken apology instead)."""
     if not base_url or not service_token:
         raise RagError("not_configured", "RAG endpoint or service token missing")
-    body = build_rag_body(question, history)
+    body = build_rag_body(question, history, time_zone=time_zone)
     try:
         response = await client.post(
             base_url.rstrip("/"),
@@ -200,6 +203,8 @@ async def iter_answer(
     should_stop=None,
     mode: str | None = None,
     on_ttfb: "Callable[[int], None] | None" = None,
+    time_zone: str | None = None,
+    on_booking: "Callable[[dict], None] | None" = None,
 ):
     """Stream answer text from the portfolio RAG as it arrives.
 
@@ -214,7 +219,7 @@ async def iter_answer(
     yields fabricated text."""
     if not base_url or not service_token:
         raise RagError("not_configured", "RAG endpoint or service token missing")
-    body = build_rag_body(question, history, mode)
+    body = build_rag_body(question, history, mode, time_zone=time_zone)
 
     async def stopped() -> bool:
         if should_stop is None:
@@ -286,6 +291,12 @@ async def iter_answer(
                     if chunk:
                         emitted += len(chunk)
                         yield chunk
+                elif ev_type == "booking" and isinstance(data, dict):
+                    if on_booking is not None:
+                        try:
+                            on_booking(data)
+                        except Exception:
+                            pass  # presentation must never break the RAG stream
                 elif ev_type == "error" and isinstance(data.get("message"), str):
                     error_event = data["message"]
                     break
@@ -293,6 +304,11 @@ async def iter_answer(
                 break
         if not error_event and not stopped_early:
             for ev in parser.close():
+                if ev["event"] == "booking" and isinstance(ev.get("data"), dict) and on_booking is not None:
+                    try:
+                        on_booking(ev["data"])
+                    except Exception:
+                        pass
                 if ev["event"] == "token" and isinstance(ev["data"].get("text"), str):
                     chunk = ev["data"]["text"]
                     if emitted + len(chunk) > max_answer_chars:

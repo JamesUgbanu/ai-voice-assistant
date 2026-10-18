@@ -45,7 +45,7 @@ Directory (Git-ignored except its README):
 
 ```
 voice-reference/
-  original/    Alimosho.m4a            (the untouched iPad/Voice Memos file)
+  original/    <private-reference-recording>.m4a            (the untouched iPad/Voice Memos file)
   processed/   voice-ref.wav           (30.00 s, 24 kHz, mono, PCM16, normalized)
   output/      preset-voice.wav        (local comparison output, disposable)
   README.md    (tracked)
@@ -55,7 +55,7 @@ Prepare:
 
 ```bash
 python3 scripts/prepare-voice-reference.py \
-  --input "/Users/user/Downloads/Alimosho.m4a" \
+  --input "<path-to-recording.m4a>" \
   --out-dir voice-reference/processed --keep-original
 ```
 
@@ -107,7 +107,7 @@ Real inference (recording supplied, real model, in Docker):
 
 | Check | Result |
 |---|---|
-| Process the real recording (`Alimosho.m4a` → normalized ref) | **PASS** |
+| Process the real recording (`<private-reference-recording>.m4a` → normalized ref) | **PASS** |
 | Clone mode preflight with the real reference | **BLOCKED** — `VoiceCloningUnavailable` (gated weights) |
 | Preset-mode real synthesis of the shared passage | **PASS** |
 | Voice-clone synthesis producing audio | **NOT TESTED** (blocked) |

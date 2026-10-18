@@ -129,6 +129,8 @@ async def run_turn(
     # the caller guarantees byte-identical input, so the transcript cannot
     # differ from a fresh decode. None (default) = normal full decode.
     preexisting_transcript: Any | None = None,
+    # A typed message can drive the same RAG/TTS turn without STT/VAD.
+    text_input: str | None = None,
     # Per-turn sink the RAG stream writes its request→first-body-byte duration
     # into (key "ms"). Scoped to one turn by the caller so concurrent turns can
     # never mix timings. None (default) = no TTFB capture.
@@ -148,41 +150,51 @@ async def run_turn(
     def alive() -> bool:
         return state.is_current(turn_id) and not cancelled.is_set()
 
-    # 1. Server-side voice check: never spend STT/RAG on silence or noise.
-    if not audio.strip(b"\x00"):
-        state.transition("idle")
-        return TurnResult(turn_id, "", "", 0), timings
-    try:
-        speech_prob = vad.speech_probability(audio)
-    except Exception:
-        return _fail(state, turn_id, timings, "stt_failed")
-    if speech_prob < vad_threshold:
-        state.transition("idle")
-        return TurnResult(turn_id, "", "", 0), timings
-
-    # 2. STT in a worker thread (blocking native call). When the incremental
-    # path already decoded exactly this audio, reuse that decode: the input
-    # bytes are identical, so the transcript is identical, and the turn skips
-    # the final decode entirely (the end-of-speech → final latency win).
-    reuse = (
-        preexisting_transcript
-        if (getattr(preexisting_transcript, "text", "") or "").strip()
-        else None
-    )
-    if reuse is not None:
-        transcript_obj = reuse
-        timings.stt_reused = True
+    # 1. A typed message bypasses VAD/STT entirely and enters the same
+    # transcript → RAG → TTS path. Voice audio still performs the checks below.
+    typed = (text_input or "").strip()
+    speech_prob = 1.0
+    diag_id: str | None = None
+    if typed:
+        from types import SimpleNamespace
+        transcript_obj = SimpleNamespace(text=typed, avg_logprob=None, no_speech=False)
+        timings.stt_ms = 0
+        timings.stt_reused = False
     else:
+        # Server-side voice check: never spend STT/RAG on silence or noise.
+        if not audio.strip(b"\x00"):
+            state.transition("idle")
+            return TurnResult(turn_id, "", "", 0), timings
         try:
-            transcript_obj = await asyncio.to_thread(stt.transcribe, audio, stt_config)
-        except asyncio.CancelledError:
-            raise
+            speech_prob = vad.speech_probability(audio)
         except Exception:
             return _fail(state, turn_id, timings, "stt_failed")
-    timings.stt_ms = clock() - t0
+        if speech_prob < vad_threshold:
+            state.transition("idle")
+            return TurnResult(turn_id, "", "", 0), timings
+
+        # 2. STT in a worker thread (blocking native call). When the incremental
+        # path already decoded exactly this audio, reuse that decode: the input
+        # bytes are identical, so the transcript is identical, and the turn skips
+        # the final decode entirely (the end-of-speech → final latency win).
+        reuse = (
+            preexisting_transcript
+            if (getattr(preexisting_transcript, "text", "") or "").strip()
+            else None
+        )
+        if reuse is not None:
+            transcript_obj = reuse
+            timings.stt_reused = True
+        else:
+            try:
+                transcript_obj = await asyncio.to_thread(stt.transcribe, audio, stt_config)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return _fail(state, turn_id, timings, "stt_failed")
+        timings.stt_ms = clock() - t0
     transcript = (transcript_obj.text or "").strip()
-    diag_id: str | None = None
-    if diag_dir and not timings.stt_reused:
+    if diag_dir and not timings.stt_reused and not typed:
         # Exact bytes just handed to stt.transcribe, plus everything needed
         # to replay the decision offline. Best-effort: capture must never
         # fail the turn, so errors are swallowed after one attempt.

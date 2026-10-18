@@ -20,7 +20,7 @@ from app.protocol import (
 
 class EnvelopeTest(unittest.TestCase):
     def test_accepts_wellformed_client_events(self):
-        for t in ("hello", "audio_frame", "end_utterance", "interrupt", "ping", "end_session"):
+        for t in ("hello", "text_message", "audio_frame", "end_utterance", "interrupt", "ping", "end_session"):
             env = validate_envelope({"v": 1, "type": t, "seq": 3, "turn_id": None, "payload": {}},
                                      max_bytes=1000, from_client=True)
             self.assertEqual(env["type"], t)
@@ -90,6 +90,8 @@ class ServerCapabilitiesTest(unittest.TestCase):
         # Clients gate the optional event on this capability, so an older server
         # (which does not advertise it) is never sent an unknown event.
         self.assertIn("playback_complete", SERVER_CAPABILITIES)
+        self.assertIn("text_message", SERVER_CAPABILITIES)
+        self.assertIn("assistant_text", SERVER_CAPABILITIES)
 
     def test_session_created_carries_capabilities(self):
         env = make_envelope(

@@ -259,3 +259,31 @@ class RagTtfbTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BookingEventTest(unittest.IsolatedAsyncioTestCase):
+    async def test_booking_event_is_captured_without_breaking_tokens(self):
+        payload = {
+            "enabled": True,
+            "timezone": "Africa/Lagos",
+            "durationMinutes": 30,
+            "slots": [{"start": "2026-10-19T09:00:00Z", "label": "Mon 19 Oct, 10:00", "durationMinutes": 30}],
+        }
+        body = sse(("booking", __import__("json").dumps(payload)), ("token", '{"text":"I can offer a time."}'))
+        captured = []
+        client = FakeStreamClient(FakeStreamResponse(200, [body]))
+        chunks = await collect(iter_answer(
+            client, "https://rag", "t", "Can I book a call?", mode="voice",
+            time_zone="Africa/Lagos", on_booking=captured.append,
+        ))
+        self.assertEqual(chunks, ["I can offer a time."])
+        self.assertEqual(captured[0]["slots"][0]["label"], "Mon 19 Oct, 10:00")
+        self.assertEqual(client.calls[0]["json"]["timeZone"], "Africa/Lagos")
+
+    async def test_booking_callback_failure_never_breaks_stream(self):
+        body = sse(("booking", '{"enabled":true,"slots":[]}'), ("token", '{"text":"Hi."}'))
+        client = FakeStreamClient(FakeStreamResponse(200, [body]))
+        def boom(_):
+            raise RuntimeError("presentation failed")
+        chunks = await collect(iter_answer(client, "https://rag", "t", "book something", on_booking=boom))
+        self.assertEqual(chunks, ["Hi."])

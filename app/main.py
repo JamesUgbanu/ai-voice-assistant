@@ -20,15 +20,16 @@ from typing import Any
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
-from . import auth, rag_client, store
+from . import auth, booking as booking_flow, rag_client, store
 from .config import Settings
 from .logging_util import configure, event
 from .pipeline import run_turn, turn_end_reason
 from .partial_stt import PartialTranscriber
 from .conversation_end import CallLifecycle, classify_completion, ending_wait_seconds
 from .greeting import greeting_reply
+from .history import append_turn, clean_history
 from .protocol import (
     SERVER_CAPABILITIES,
     is_fatal_error,
@@ -68,6 +69,10 @@ _httpx_client = None
 #: Composer-dictation rate limits (in-process, single worker).
 _transcribe_throttle = WindowLimiter()
 _ticket_throttle = WindowLimiter()
+#: "Listen to response" TTS-only endpoints (no voice session or allowance).
+_tts_throttle = WindowLimiter()
+_tts_ticket_throttle = WindowLimiter()
+TTS_SUBJECT_PREFIX = "tts:"
 #: Cross-session single-flight gate for incremental (partial) transcription.
 #: The STT model and one CPU core are shared; a partial decode from another
 #: connection must never build a backlog ahead of a turn's final decode.
@@ -422,6 +427,129 @@ def create_app() -> FastAPI:
             {"text": transcript.text or "", "no_speech": bool(getattr(transcript, "no_speech", False))}
         )
 
+    @app.post("/v1/tts/ticket")
+    async def tts_ticket(request: Request):
+        """Mint a short-lived ticket for reading an existing chat answer aloud.
+
+        This is intentionally separate from voice sessions: listening must not
+        request microphone permission or consume the daily call allowance."""
+        await wait_until_warm()
+        now = time.time()
+        ip_hash = auth.hash_ip(_client_ip(request), _hmac_secret_salt())
+        allowed, retry = _tts_ticket_throttle.allow(
+            f"tts-ticket:{ip_hash}", settings.tts_ticket_per_minute, 60_000, int(now * 1000)
+        )
+        if not allowed:
+            metric("tts_ticket_rejected")
+            return JSONResponse(
+                {"error": {"code": "rate_limited", "message": "Too many requests. Try again shortly."}},
+                status_code=429,
+                headers={"Retry-After": str(max(1, retry // 1000))},
+            )
+        visitor_id = request.cookies.get(auth.COOKIE_NAME, "")
+        new_visitor = not auth.is_valid_id(visitor_id)
+        if new_visitor:
+            visitor_id = auth.new_visitor_id()
+        expiry = now + settings.tts_ticket_ttl_seconds
+        ticket = auth.issue_ticket(
+            _ticket_secret(), f"{TTS_SUBJECT_PREFIX}{visitor_id}", expiry
+        )
+        response = JSONResponse(
+            {"ticket": ticket, "expires_at": int(expiry), "sample_rate": 24000}
+        )
+        if new_visitor:
+            secure = request.url.scheme == "https"
+            response.set_cookie(
+                auth.COOKIE_NAME,
+                visitor_id,
+                max_age=365 * 24 * 3600,
+                path="/",
+                httponly=True,
+                secure=secure,
+                samesite="none" if secure else "lax",
+            )
+        return response
+
+    @app.post("/v1/tts")
+    async def tts_listen(request: Request):
+        """Synthesize existing assistant text through the same TTS backend.
+
+        No RAG, no transcript storage, and no microphone. Text is bounded and
+        never logged; only the resolved voice metadata is observable."""
+        now = time.time()
+        ticket = request.headers.get("x-voice-ticket", "")
+        subject = (
+            auth.verify_ticket(
+                _ticket_secret(), ticket, now=now,
+                max_age_seconds=settings.tts_ticket_ttl_seconds,
+            )
+            if ticket
+            else None
+        )
+        if not subject or not subject.startswith(TTS_SUBJECT_PREFIX):
+            metric("tts_unauthorized")
+            return JSONResponse(
+                {"error": {"code": "unauthorized", "message": "Audio ticket invalid or expired."}},
+                status_code=401,
+            )
+        ip_hash = auth.hash_ip(_client_ip(request), _hmac_secret_salt())
+        allowed, retry = _tts_throttle.allow(
+            f"tts:{ip_hash}", settings.tts_per_minute, 60_000, int(now * 1000)
+        )
+        if not allowed:
+            metric("tts_rejected")
+            return JSONResponse(
+                {"error": {"code": "rate_limited", "message": "Too many audio requests. Try again shortly."}},
+                status_code=429,
+                headers={"Retry-After": str(max(1, retry // 1000))},
+            )
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw.extend(chunk)
+            if len(raw) > 16_384:
+                return JSONResponse(
+                    {"error": {"code": "too_large", "message": "That response is too long to read aloud."}},
+                    status_code=413,
+                )
+        try:
+            body = json.loads(bytes(raw))
+        except Exception:
+            body = None
+        text = body.get("text") if isinstance(body, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            return JSONResponse(
+                {"error": {"code": "bad_message", "message": "Text is required."}},
+                status_code=400,
+            )
+        text = text.strip()
+        if len(text) > settings.tts_listen_max_chars:
+            return JSONResponse(
+                {"error": {"code": "too_large", "message": "That response is too long to read aloud."}},
+                status_code=413,
+            )
+        await wait_until_warm()
+        try:
+            models = await get_models()
+            voice = models["tts"]
+            pcm = await asyncio.to_thread(voice.synthesize_full, text, _tts_config())
+        except Exception:
+            metric("tts_failed")
+            return JSONResponse(
+                {"error": {"code": "tts_failed", "message": "Could not read that response. Please try again."}},
+                status_code=500,
+            )
+        metric("tts_ok")
+        await asyncio.to_thread(_trim_memory)
+        return Response(
+            content=pcm,
+            media_type="audio/L16",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Sample-Rate": str(voice.sample_rate),
+                "Access-Control-Expose-Headers": "X-Sample-Rate",
+            },
+        )
+
     @app.websocket("/v1/voice")
     async def voice_socket(websocket: WebSocket):
         origin = websocket.headers.get("origin", "")
@@ -493,11 +621,11 @@ async def _handle_socket(websocket: WebSocket) -> None:
     except (asyncio.TimeoutError, Exception):
         await websocket.close(code=4408)
         return
-    if len(raw.encode()) > 4096:
+    if len(raw.encode()) > 32768:
         await websocket.close(code=4409)
         return
     try:
-        hello = validate_envelope(json.loads(raw), max_bytes=4096, from_client=True)
+        hello = validate_envelope(json.loads(raw), max_bytes=32768, from_client=True)
     except Exception:
         await websocket.close(code=4400)
         return
@@ -526,6 +654,11 @@ async def _handle_socket(websocket: WebSocket) -> None:
     turn_task: asyncio.Task | None = None
     audio_buf = bytearray()
     audio_frames = 0
+    # Same-session conversational memory. The portfolio RAG owns grounding;
+    # this list only carries recent turns over the existing authenticated API.
+    history: list[dict] = clean_history(payload.get("history"))
+    # Session-local voice booking state; never shared across WebSockets.
+    booking = booking_flow.VoiceBookingSession()
     last_ping_at = 0.0
     started_at = float(row["started_at"])
     max_seconds = int(row["max_seconds"])
@@ -653,7 +786,8 @@ async def _handle_socket(websocket: WebSocket) -> None:
         await asyncio.to_thread(_trim_memory)
 
     async def run_utterance(
-        turn_id: str, pcm: bytes, reused_transcript=None, decision: dict | None = None
+        turn_id: str, pcm: bytes, reused_transcript=None, decision: dict | None = None,
+        text_input: str | None = None,
     ) -> None:
         nonlocal turn_cancel, turn_task
         # When the incremental path already decoded exactly this audio, the
@@ -689,6 +823,7 @@ async def _handle_socket(websocket: WebSocket) -> None:
                 settings.rag_api_url,
                 settings.rag_service_token,
                 text,
+                history=list(history),
                 timeout_seconds=settings.rag_timeout_seconds,
             )
             return out.text
@@ -698,9 +833,50 @@ async def _handle_socket(websocket: WebSocket) -> None:
         # can never overwrite each other's timing.
         ttfb_out: dict = {}
 
+        async def call_booking_api(payload: dict) -> dict:
+            if not settings.booking_api_url:
+                return {"status": "failed", "message": "Voice booking is not configured."}
+            try:
+                client = await http_client()
+                response = await client.post(
+                    settings.booking_api_url,
+                    json=payload,
+                    timeout=settings.booking_timeout_seconds,
+                )
+                try:
+                    body = response.json()
+                except Exception:
+                    body = {}
+                if not isinstance(body, dict):
+                    body = {}
+                if response.status_code in (200, 201) and body.get("status") == "confirmed":
+                    return body
+                if response.status_code == 202 or body.get("status") == "uncertain":
+                    return {"status": "uncertain", "message": "The booking could not be confirmed."}
+                if response.status_code == 409 or body.get("status") == "slot_unavailable":
+                    return {"status": "slot_unavailable", "message": "That slot is no longer available."}
+                return {"status": "failed", "message": "The booking was not confirmed."}
+            except Exception:
+                # A timeout is uncertain: the event may exist. Never speak a
+                # confirmation. The portfolio reconciles by idempotency key.
+                return {"status": "uncertain", "message": "The booking request timed out."}
+
+        def capture_booking(data: dict) -> None:
+            booking.capture_offer(data)
+
         async def rag_stream(text: str):
-            # Stream the portfolio answer token-by-token so TTS can start on
-            # the first natural segment instead of the full response.
+            # Pending voice booking turns are deterministic; unrelated turns
+            # fall through to ordinary RAG.
+            reply, payload = booking.handle(text, settings.booking_timezone)
+            if reply is not None:
+                yield reply
+                return
+            if payload is not None:
+                result = await call_booking_api(payload)
+                message = booking_flow.result_message(result, booking.slot or {}, settings.booking_timezone)
+                booking.clear()
+                yield message
+                return
             client = await http_client()
             from . import rag_client as rc
 
@@ -710,9 +886,12 @@ async def _handle_socket(websocket: WebSocket) -> None:
                 settings.rag_api_url,
                 settings.rag_service_token,
                 text,
+                history=list(history),
                 timeout_seconds=settings.rag_timeout_seconds,
                 should_stop=(lambda: stop_event.is_set()) if stop_event else None,
                 mode="voice",
+                time_zone=settings.booking_timezone,
+                on_booking=capture_booking,
                 on_ttfb=lambda ms: ttfb_out.__setitem__("ms", ms),
             ):
                 yield chunk
@@ -763,6 +942,7 @@ async def _handle_socket(websocket: WebSocket) -> None:
                 on_transcript=on_transcript,
                 diag_dir=_diag_capture_dir(),
                 preexisting_transcript=reused_transcript,
+                text_input=text_input,
                 ttfb_out=ttfb_out,
             )
         except asyncio.CancelledError:
@@ -814,9 +994,20 @@ async def _handle_socket(websocket: WebSocket) -> None:
         # state.is_current: a completed turn is already idle, so gating the
         # completion event on liveness silently swallowed turn_end(complete)
         # (client stuck 'speaking') and turn_end(error).
+        # Record only a completed, uncancelled turn. The transcript is the
+        # authoritative decode; the answer is what the visitor actually heard.
+        # Retries cannot duplicate it because this runs once per completed turn.
+        if not result.cancelled and not result.error:
+            append_turn(history, result.transcript, result.answer_text)
         reason = turn_end_reason(result)
         if reason is None:
             return
+        if not result.cancelled and not result.error and result.answer_text.strip():
+            await send(make_envelope(
+                "assistant_text",
+                {"text": result.answer_text.strip()},
+                turn_id=turn_id,
+            ))
         if reason == "complete":
             event(logger, "turn_complete", frames=result.audio_frames)
         elif reason == "empty":
@@ -858,7 +1049,44 @@ async def _handle_socket(websocket: WebSocket) -> None:
             etype = env_msg["type"]
             payload = env_msg["payload"]
 
-            if etype == "ping":
+            if etype == "text_message":
+                text = payload.get("text")
+                if not isinstance(text, str) or not text.strip() or len(text) > 500:
+                    await send(make_envelope("error", {"code": "bad_message", "message": "Enter a short message."}))
+                    continue
+                if call.reversible:
+                    cancel_ending()
+                # A typed message supersedes an in-flight spoken turn. This is
+                # the same cancellation path used by barge-in, not a second
+                # conversation engine.
+                # A typed turn supersedes any collecting/processing/speaking
+                # turn, including a spoken utterance that has not ended yet.
+                if state.state != "idle" or (turn_task is not None and not turn_task.done()):
+                    await end_turn_state("interrupted")
+                state.begin_turn()
+                turn_started_at = time.monotonic()
+                partial_times["first"] = None
+                tid_typed = state.turn_id
+                if tid_typed is None:
+                    continue
+                await partial.stop()
+                decision_typed: dict = {}
+
+                async def _guarded_typed(tid_: str = tid_typed, text_: str = text) -> None:
+                    try:
+                        await run_utterance(tid_, b"", None, decision_typed, text_input=text_)
+                    except Exception as exc:
+                        event(logger, "turn_failed", error=type(exc).__name__)
+                        try:
+                            await send(make_envelope("turn_end", {"reason": "server_error", "turn_id": tid_}))
+                        except Exception:
+                            pass
+                        return
+                    if decision_typed.get("should_end"):
+                        await begin_ending(int(decision_typed.get("frames", 0)))
+
+                turn_task = asyncio.create_task(_guarded_typed())
+            elif etype == "ping":
                 # Throttled via protocol.should_answer_ping: session_alive()
                 # hits SQLite, so a ping flood must not become a DB flood.
                 # Heartbeat timeout below covers genuinely idle connections.

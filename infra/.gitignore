@@ -1,0 +1,23 @@
+# Terraform state, plans, and local overrides must never be committed.
+.terraform/
+.terraform.tfstate.lock.info
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfplan
+*.tfplan.json
+plan.out
+plan.out.json
+
+# Never commit real variable values. Track only the example files.
+*.tfvars
+!terraform.tfvars.example
+*.auto.tfvars
+!*.auto.tfvars.example
+
+# Keys/secrets that operators may keep next to the config while testing.
+secrets/
+*.pem
+*.key
+!*.pub

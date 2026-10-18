@@ -1,5 +1,11 @@
 # Deployment, operations, rollback
 
+> **LEGACY — NOT THE CURRENT DEPLOYMENT RUNBOOK.** This document describes the
+> older long-lived Compose host. For the current scheduled Lambda + private
+> GHCR + Cloudflare Tunnel lifecycle, see [deploy/README.md](deploy/README.md).
+> The content below is retained for historical troubleshooting; the target and
+> RAM verdict are stale.
+
 Target: Oracle Cloud Ubuntu ARM VPS (2 OCPU / ~12 GB RAM nominal —
 **unverified; Phase 2 records actuals here before any public traffic**).
 

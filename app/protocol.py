@@ -18,11 +18,11 @@ Rules:
   audio frames additionally capped (max_audio_frame_bytes) and total
   audio per turn capped (max_turn_audio_seconds).
 
-Client → server: hello, audio_frame, end_utterance, interrupt,
-                 ping, end_session
+Client → server: hello, text_message, audio_frame, end_utterance,
+                 interrupt, ping, end_session
 Server → client: session_created, listening, transcript_partial,
-                 transcript_final, rag_started, audio_frame, turn_end,
-                 quota, error, pong, session_ended
+                 transcript_final, assistant_text, rag_started, audio_frame,
+                 turn_end, quota, error, pong, session_ended
 
 This module validates inbound envelopes without any framework or audio
 dependency so the contract is unit-testable on stdlib alone.
@@ -36,6 +36,7 @@ PROTOCOL_VERSION = 1
 
 CLIENT_EVENTS = frozenset({
     "hello",
+    "text_message",
     "audio_frame",
     "end_utterance",
     "interrupt",
@@ -51,6 +52,7 @@ SERVER_EVENTS = frozenset({
     "listening",
     "transcript_partial",
     "transcript_final",
+    "assistant_text",
     "rag_started",
     "audio_frame",
     "turn_end",
@@ -66,6 +68,8 @@ SERVER_EVENTS = frozenset({
 #: (which the strict envelope validator would reject as `bad_message`).
 SERVER_CAPABILITIES = frozenset({
     "playback_complete",  # client can confirm playback drained (auto-end gate)
+    "text_message",       # client can send a typed turn on this voice session
+    "assistant_text",     # server can expose the final answer text for transcript
 })
 
 

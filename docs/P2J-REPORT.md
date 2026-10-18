@@ -42,7 +42,7 @@ PostgreSQL, Chidera and Alimosho are exact with it, wrong without it; (b)
 **base.en + greedy** is ~4× faster than small.en at WER 0.031 vs 0.000 (only the
 long sentence differs: "how James approaches reliable" → "how James' approach
 is reliable"); (c) on a **real Nigerian-English segment** (from the authorized
-`Alimosho.m4a`), small.en and base.en produce the *same* transcript ("I enjoy
+`<private-reference-recording>.m4a`), small.en and base.en produce the *same* transcript ("I enjoy
 solving practical engineering problems"), i.e. no observed loss on real
 Nigerian speech. Chosen default: **`base.en`, `beam_size=1`, initial_prompt**,
 all env-configurable. `small.en` remains the documented fallback via

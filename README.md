@@ -16,18 +16,26 @@ Capabilities (all verified by the unit suite plus live browser/WS probes):
 
 - Voice calls: mic → VAD → faster-whisper `base.en` → portfolio RAG → Pocket
   TTS → streamed PCM16 playback, with per-turn cancellation.
-- Live transcription while speaking: rolling-window partials (`transcript_partial`)
-  stream into the UI before the utterance ends, then the authoritative
-  `transcript_final` replaces them (see §10a and `docs/STREAMING-STT-REPORT.md`).
+- Incremental decoding while speaking: rolling-window hypotheses
+  (`transcript_partial`) remain internal; only a generic "Processing…" state is
+  shown until the authoritative `transcript_final` and spoken answer arrive
+  (see §10a and `tests/test_partial_stt.py`).
 - Barge-in: sustained speech during playback stops the answer (client energy
   detector + server turn cancel), then the interruption is captured as the
   next turn. A manual Interrupt button does the same.
 - Composer dictation: `POST /v1/transcribe` transcribes one recording with
   the same loaded Whisper model (short-lived HMAC ticket, no browser secrets).
+- Listen to response: `POST /v1/tts` reads an existing assistant answer through
+  the same TTS model; `POST /v1/tts/ticket` mints its short-lived HMAC ticket.
+  This path never opens a microphone, runs RAG, or consumes a call session.
 - Deterministic greeting fast path: exact-match greetings answer locally
   without an RAG round trip.
 - Quotas enforced server-side: 5-minute calls, daily allowance, one active
   session per visitor, per-IP attempt/rate budgets, bounded audio per turn.
+- Optional voice booking: captures server-provided slots from the RAG stream,
+  collects missing name/email, requires explicit confirmation, and calls the
+  portfolio's shared public `/api/booking` service. Booking state is local to the
+  call; an uncertain result is never spoken as confirmed.
 
 Limitations: answer speed follows the remote RAG (LLM) latency; recognition
 follows microphone quality (see Troubleshooting). The production target is a
@@ -49,8 +57,9 @@ Browser mic ──WS/PCM16 16 kHz──▶ voice server ──HTTPS/SSE──▶
 - Turn ids correlate STT → RAG → TTS → playback end to end; late frames from a
   superseded turn are discarded, never played.
 - While collecting, the growing audio is also fed to the incremental path
-  (`partial_stt.py`), which emits replaceable `transcript_partial` events; the
-  turn's single authoritative decode still produces `transcript_final`.
+  (`partial_stt.py`), which emits replaceable `transcript_partial` events. These
+  are internal; the UI never renders them. The turn's single authoritative
+  decode still produces `transcript_final`.
 - `interrupt` (button or voice-triggered) cancels the in-flight turn task,
   which closes the upstream RAG stream and stops the TTS producer — the whole
   obsolete pipeline, not just playback.
@@ -85,20 +94,20 @@ app/
 tests/               stdlib unittest suite — no model packages required
 scripts/prepare-voice-reference.py  Validate + normalize a reference recording
 Dockerfile           CPU-only Python 3.12-slim, non-root `voice` user, healthcheck
-docker-compose.yml   voice + Caddy TLS, volumes, caps, log rotation (production shape)
+docker-compose.yml   local/dev/manual legacy shape (voice + Caddy TLS, volumes, caps)
 docker-compose.local.yml  Local-dev overlay: published port, host gateway,
                      voice-reference mount, localhost origins (NOT for production)
-Caddyfile            TLS for voice.jamesugbanu.com; proxies only
-                     /v1/sessions, /v1/voice, /healthz (`/metrics` stays internal)
+Caddyfile            Legacy/manual-host TLS for voice.jamesugbanu.com; production
+                     ingress is the Cloudflare Tunnel
 PROTOCOL.md          Full browser↔server protocol reference
 INTEGRATION.md       Verified portfolio RAG contract + examples
 DEPLOY.md            Legacy long-lived-Compose runbook (not the scheduled path)
-deploy/README.md     Authoritative production runbook (release, SSM, IPv4, TLS)
+deploy/README.md     Authoritative production runbook (release, SSM, IPv4, Cloudflare Tunnel)
 deploy/cloud-init.yaml  Bootstrap template (also bundled into the Lambda)
-deploy/cost-estimate.py  Hetzner 195 h/month budget calculator
+deploy/cost-estimate.py  Hetzner hourly-cost calculator (configured hours)
 scripts/release.sh   Build/push the private linux/amd64 image; print digest
-docs/                Phase investigation reports (P2A–P2T): measurements and
-                     calibration evidence referenced by code comments
+docs/                Historical phase reports (`P2*`, `VOICE-*`): measurements,
+                     audits, and calibration evidence; not current guarantees
 voice-reference/     Private recordings (Git-ignored) + tracked README
 ```
 
@@ -117,7 +126,7 @@ voice-reference/     Private recordings (Git-ignored) + tracked README
 
 ```bash
 cp .env.example .env   # then set the three required secrets (see §6)
-python3 -m unittest discover -s tests        # 247 tests (5 skipped), stdlib only
+python3 -m unittest discover -s tests        # 262 tests (5 skipped), stdlib only
 docker compose up -d --build                 # local/dev: voice + Caddy + host reference
 docker compose ps                            # voice healthy, caddy running
 curl -fsS http://127.0.0.1:8000/healthz      # db/warm true; tts reports the resolved mode
@@ -175,6 +184,9 @@ no default and are required. Never commit real values (`.env` is Git-ignored).
 | `VOICE_MAX_TURN_AUDIO_SECONDS` | no | `60` | Max audio per turn |
 | `VOICE_MAX_MESSAGE_BYTES` | no | `262144` | Max WS message |
 | `VOICE_RAG_TIMEOUT_SECONDS` | no | `25` | Per-operation timeout on the RAG stream |
+| `VOICE_BOOKING_API_URL` | no | derived | Portfolio booking API; derived from `VOICE_RAG_API_URL` when it ends in `/api/rag` |
+| `VOICE_BOOKING_TIMEZONE` | no | `Africa/Lagos` | Timezone sent to RAG labels and read back during voice booking |
+| `VOICE_BOOKING_TIMEOUT_SECONDS` | no | `20` | Booking API timeout; timeout is uncertain, never confirmed |
 | `VOICE_DB_PATH` | no | `data/voice.sqlite3` | SQLite path (compose sets `/srv/voice/data/…`) |
 | `VOICE_PUBLIC_BASE_URL` | no | empty | Origin used to build `ws_url` (`ws://`+path locally, `wss://` in prod) |
 | `VOICE_ALLOWED_ORIGINS` | no | portfolio origin | Explicit browser origins (no wildcards) |
@@ -204,7 +216,7 @@ curl -fsS http://localhost:8000/metrics     # operational counters only
 |---|---|---|
 | STT | faster-whisper `base.en`, int8 (CTranslate2) | ~400 MB with workspace; beam 1 greedy at temp 0; `initial_prompt` restores proper nouns; a confidence + repetition guard rejects hallucinations (`app/stt.py`) |
 | VAD | Silero VAD via `torch.hub` | ~4 MB; `VOICE_VAD_SOURCE=local:…` vendors it; 512-sample minimum window |
-| TTS | Kyutai Pocket TTS ~100 M params, fp32 | ~550 MB + runtime; preset voice always works; **clone** needs the gated `kyutai/pocket-tts` weights (accept terms + `HF_TOKEN`) or the adapter raises instead of substituting |
+| TTS | Kyutai Pocket TTS ~100 M params, fp32 | ~550 MB + runtime; **clone** is the production mode and needs the gated `kyutai/pocket-tts` weights (accept terms + `HF_TOKEN`); if the reference/weights are missing it raises instead of substituting. Preset mode is explicit local/dev configuration. |
 | Runtime | CPU torch (Linux installs from the CPU index — see Dockerfile) | `OMP_NUM_THREADS=2`, `MALLOC_ARENA_MAX=2` bound threading/fragmentation |
 
 Weights download on first run into `HF_HOME` (`voice-models` volume) and are
@@ -216,8 +228,10 @@ fiction). Licenses: faster-whisper/CTranslate2 MIT; Pocket TTS MIT code with
 ## 9. Remote RAG integration
 
 - `POST {VOICE_RAG_API_URL}`, JSON `{"question": <3..500 chars>, "history": [≤6 × {question ≤500, answer ≤2000}], "debug": false}`,
-  header `Authorization: Bearer <token>`. See `INTEGRATION.md` for the verified
-  contract — re-verify there before changing `app/rag_client.py`.
+  header `Authorization: Bearer <token>`. The service sends the last six
+  completed, uncancelled turns so voice conversations retain context; retries
+  cannot duplicate them. See `INTEGRATION.md` for the verified contract —
+  re-verify there before changing `app/rag_client.py`.
 - The portfolio streams SSE (`meta` / `token` / `sources` / `done` / `error`);
   the voice service synthesizes from the first speakable segment (no full
   buffering) and closes the upstream request on cancel/timeout.
@@ -233,8 +247,12 @@ fiction). Licenses: faster-whisper/CTranslate2 MIT; Pocket TTS MIT code with
 - Open the Ask James panel → Voice tab → Start talking (microphone permission
   is requested only on this explicit tap, never on page load).
 - Speak, pause ~1 s: the client endpoints the utterance, the server
-  transcribes, and the answer plays. Exact greetings ("hello", "hi", …) answer
-  instantly without an RAG round trip.
+  transcribes, and the answer plays. The transcription itself is not shown;
+  the panel indicates processing and then plays the reply. Exact greetings
+  ("hello", "hi", …) answer instantly without an RAG round trip.
+- Type in the composer while a call is active: the typed turn uses the same
+  WebSocket, RAG/booking state, and TTS path. Completed text and voice turns
+  share one transcript.
 - Interrupt anytime: the on-screen Interrupt button, or just start talking —
   sustained speech during playback stops the answer and your speech becomes
   the next turn. Headphones are most reliable; quiet speech below the room
@@ -249,8 +267,8 @@ fiction). Licenses: faster-whisper/CTranslate2 MIT; Pocket TTS MIT code with
 ## 10a. Incremental transcription (live partials)
 
 While the user is speaking, the server re-decodes the audio accumulated so
-far on a debounce and emits `transcript_partial`; the UI shows the evolving
-text, replacing each hypothesis rather than appending. On `end_utterance` the
+far on a debounce and emits `transcript_partial`; the hypotheses are internal
+(the UI intentionally shows no live transcription). On `end_utterance` the
 authoritative `transcript_final` is produced and only that is sent to RAG.
 
 The decoder (faster-whisper) is **batch**, so this is approximate streaming,
@@ -273,13 +291,14 @@ not native incremental decoding — stated plainly:
   the turn.
 - Rollback: `VOICE_STT_STREAMING=0` disables partials and reuse entirely;
   behavior returns to the pre-streaming path (final latency unchanged from
-  before). See `docs/STREAMING-STT-REPORT.md` for root cause, trade-offs,
-  measurements, and revert steps.
+  before). See `tests/test_partial_stt.py` for the contract and
+  `docs/P2U-LATENCY-REPORT.md` / `docs/P2Y-STT-LATENCY-REPORT.md` for related
+  latency and capture measurements.
 
 ## 11. Testing and validation
 
 ```bash
-python3 -m unittest discover -s tests        # 247 tests (5 skipped), stdlib only
+python3 -m unittest discover -s tests        # 262 tests (5 skipped), stdlib only
 python3 -m unittest tests.test_stt_guard -v  # hallucination-guard contract
 python3 -m py_compile app/*.py tests/*.py    # static check (no deps)
 ```
@@ -306,8 +325,8 @@ image**. The image bakes the authorized reference (Option A), so the host never
 receives it and no host bind mount may shadow it.
 
 The authoritative runbook is `deploy/README.md` (release, GHCR, SSM secrets,
-retained IPv4, Terraform, DNS/TLS, live checks). Scheduler detail lives in
-`../terraform-voice-scheduler/DEPLOY.md`. Operating hours are changed with
+retained IPv4, Terraform, Cloudflare Tunnel, live checks). Scheduler detail
+lives in `../terraform-voice-scheduler/DEPLOY.md`. Operating hours are changed with
 `../terraform-voice-scheduler/scripts/set-voice-hours.sh show|plan|apply`; it
 preserves the enabled/disabled state and never provisions a server.
 
@@ -315,13 +334,16 @@ High-level flow:
 
 1. Publish `ghcr.io/jamesugbanu/james-voice-service:<immutable version>` as a
    private `linux/amd64` package and record the registry digest.
-2. Create the seven SSM SecureStrings in `eu-west-2` (RAG bearer, HMAC, IP
-   salt, HF token, Hetzner token, read-only GHCR user/token).
+2. Create the eight SSM SecureStrings in `eu-west-2` (RAG bearer, HMAC, IP
+   salt, HF token, Hetzner token, read-only GHCR user/token, Cloudflare Tunnel
+   credentials).
 3. Allocate the retained Hetzner Primary IPv4 outside Terraform; set
    `primary_ip_id`.
 4. `terraform apply` creates the Lambda/schedules only; schedules stay
    disabled until a manual provision/teardown has been verified.
-5. Point `voice.jamesugbanu.com` at the retained IP and complete TLS.
+5. Route `voice.jamesugbanu.com` through the Cloudflare Tunnel (proxied
+   CNAME); Cloudflare provides edge TLS. The retained IPv4 is for SSH/ops, not
+   public ingress.
 6. Invoke `provision`; the host pulls the pinned digest, pre-downloads models,
    starts the container, and `/healthz` must report `db=true`, `warm=true`, and
    `tts.cloning_active=true` in clone mode.
@@ -334,11 +356,13 @@ Legacy `docker-compose.yml` + `Caddyfile` remain for local/dev and manual hosts;
 `DEPLOY.md` is the older long-lived-Compose guide and is stale for the scheduled
 lifecycle. Use `deploy/README.md` for production.
 
-- Caddy proxies **only** `/v1/sessions`, `/v1/voice`, `/healthz`; `/metrics`
-  stays internal.
-- The current bootstrap publishes the API on loopback only and has **no TLS
-  proxy**. Do not provision until the TLS decision in `deploy/README.md` is
-  approved and implemented.
+- Cloudflare Tunnel ingress allows only `/v1/sessions`, `/v1/voice`,
+  `/healthz`, `/v1/transcribe`, `/v1/transcribe/ticket`, `/v1/tts`, and
+  `/v1/tts/ticket`; `/metrics` is not routed. The app stays loopback-only; no
+  inbound 80/443 is exposed. The TTS routes must be added to the deployed
+  ingress before the Listen to response control is enabled in production.
+- Cloudflare Tunnel is the TLS front; there is no origin certificate to renew.
+  Do not expose port 8000 publicly.
 - Rollback: pin the previous immutable version or digest and re-provision;
   never use `latest`/`stable` in production.
 
@@ -400,11 +424,10 @@ Confirmed (measured, not aspirational):
   production target is a 4 GB x86-64 host; ARM throughput is unmeasured. Root
   `DEPLOY.md` is the legacy long-lived-Compose guide; `deploy/README.md` is
   authoritative for the scheduled lifecycle.
-- TLS must survive daily server deletion. Automatic ACME would reissue the same
-  certificate on every provision (~7/week, above Let's Encrypt's
-  duplicate-certificate limit). The TLS persistence decision is documented in
-  `deploy/README.md` but is **not yet implemented**; HTTPS is not production
-  ready until it is.
+- TLS is terminated by Cloudflare at the edge through the Tunnel; there is no
+  origin certificate to renew or persist across daily server recreation. The
+  retained IPv4 is not used for public ingress. The legacy Caddy/Compose path
+  remains only for manual/local hosts.
 - Nigerian-English/Pidgin/Yoruba accuracy is **not** claimed as validated;
   proper-noun biasing via `initial_prompt` is measured on file audio only.
 - Incremental partials are **approximate** (whole-window re-decode, not native
