@@ -2,10 +2,11 @@
 
 A tiny, strict matcher: the entire finalized transcript must normalize to an
 exact known greeting. This lets "hello" get a spoken reply immediately without
-a remote RAG round trip (which costs seconds and, for the portfolio's social
-path, an LLM call), while any message with extra content — including
-"Hello, can you explain my RAG architecture?" — falls through to RAG.
+a remote backend round trip, while any message with extra content — including
+"Hello, can you explain the architecture?" — falls through to the responder.
 
+The reply strings below are examples from the reference assistant; edit them
+for your own persona (or remove phrases you want sent to the backend).
 No classifier, no LLM: exact-string membership after normalization. A
 low-confidence/corrupted transcript is never treated as a greeting.
 """

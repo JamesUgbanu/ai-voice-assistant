@@ -1,9 +1,10 @@
 # Voice protocol v1
 
-Public base URL: `https://voice.jamesugbanu.com`. In production Cloudflare
-terminates TLS and forwards through an outbound Cloudflare Tunnel to the service;
-local/dev may use Caddy or the Compose stack. REST is JSON over HTTPS; realtime
-audio is one WebSocket per call.
+Public base URL: your deployment origin (the reference deployment uses
+`https://voice.jamesugbanu.com`). In production a TLS terminator such as
+Cloudflare Tunnel or Caddy forwards to the service; local/dev may use Caddy or
+the Compose stack. REST is JSON over HTTPS; realtime audio is one WebSocket per
+call.
 
 ## Session handshake (REST)
 

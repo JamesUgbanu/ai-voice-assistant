@@ -36,7 +36,7 @@ class SttConfig:
     # CTranslate2 threads. 0 lets the library pick.
     cpu_threads: int = 0
     # Domain biasing: Whisper conditions on this text, which markedly improves
-    # proper nouns and technical vocabulary (PostgreSQL, Chidera, Alimosho…).
+    # proper nouns and product/place vocabulary.
     initial_prompt: str = ""
     hotwords: str = ""
     # 0.0 = deterministic greedy fallback (best for short utterances); the
@@ -57,11 +57,11 @@ _WORD_RE = re.compile(r"[a-z0-9']+")
 
 #: Hallucinated decoder output is rejected below these floors. Genuine
 #: utterances — including repeated words ("Hello. Hello.", -0.25/0.04),
-#: prompted proper nouns ("…Chidera and Alimosho.", -0.32/0.00) and quiet but
-#: complete speech ("Hello.", -0.12/0.05) — score far better, while real
-#: browser captures of degraded fragments ("Alo." -0.93/0.08, "Blo."
-#: -0.89/0.16, "Welcome home." -0.87/0.25, "So." -1.73/0.59,
-#: "Alimosho, Alimosho," -0.77/0.30) score far worse. (stat = avg_logprob /
+#: prompted proper nouns (-0.32/0.00) and quiet but complete speech
+#: ("Hello.", -0.12/0.05) — score far better, while real browser captures of
+#: degraded fragments ("Alo." -0.93/0.08, "Blo." -0.89/0.16,
+#: "Welcome home." -0.87/0.25, "So." -1.73/0.59, repeated proper nouns
+#: -0.77/0.30) score far worse. (stat = avg_logprob /
 #: mean no_speech_prob; base.en, beam 1, measured on file and browser audio.)
 _NO_SPEECH_PROB_CEILING = 0.5
 _GUARD_NSP_FLOOR = 0.06
@@ -175,8 +175,8 @@ class FasterWhisperBackend(SttBackend):
         if not text:
             return Transcript(text="", no_speech=True, avg_logprob=avg_logprob)
         if is_hallucinated_transcript(text, avg_logprob, nsps):
-            # Never send decoder hallucinations ("Alimosho, Alimosho",
-            # "No. No. No…") to RAG or the UI; the caller treats no_speech as
+            # Never send decoder hallucinations (repeated words or proper
+            # nouns) to RAG or the UI; the caller treats no_speech as
             # an empty turn and the client returns to listening.
             return Transcript(text="", no_speech=True, avg_logprob=avg_logprob)
         return Transcript(

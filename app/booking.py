@@ -24,16 +24,58 @@ BOOK_RE = re.compile(r"\b(book|schedule|appointment|meeting|call)\b", re.I)
 FRESH_RE = re.compile(r"\b(available|availability|times?|slots?|another|different|next week|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.I)
 NAME_INTRO_RE = re.compile(r"(?i:my name is|this is|i am|i'm|call me)")
 
+# Explicit restart/abandon requests must release the booking flow.
+RESTART_RE = re.compile(
+    r"\b(start over|start again|restart|new conversation|reset|forget (it|the booking)|never ?mind)\b",
+    re.I,
+)
+# A full portfolio question during booking is a subject change, not a reply.
+# Mirrors the portfolio's own topic-change rule so the voice service releases
+# the flow and lets RAG answer instead of asking "which time?".
+TOPIC_FACTUAL_RE = re.compile(
+    r"\b(james|you|your|experience|project|projects|built|work|worked|technolog|skill|aws|react|terraform|rag|agent|contact|hire|hiring|role|resume|cv)\b",
+    re.I,
+)
+TOPIC_QUESTION_RE = re.compile(
+    r"\b(what|which|how|why|where|when|who|tell|explain|describe|show)\b", re.I
+)
+
+
+def wants_restart(text: str) -> bool:
+    return bool(RESTART_RE.search(text or ""))
+
+
+def looks_like_topic_change(text: str) -> bool:
+    q = (text or "").strip()
+    if len(q) <= 24:
+        return False
+    return bool(TOPIC_FACTUAL_RE.search(q) and TOPIC_QUESTION_RE.search(q))
+
+
+DAY_ABBR = {
+    "monday": "mon", "tuesday": "tue", "wednesday": "wed", "thursday": "thu",
+    "friday": "fri", "saturday": "sat", "sunday": "sun",
+}
+
+
+def mentions_unoffered_weekday(text: str, slots: list[dict]) -> bool:
+    """True when the visitor names a weekday that none of the offered slots is
+    on. Prevents "Friday" from selecting a Thursday slot just because the clock
+    time matches; the caller then asks the portfolio for fresh availability."""
+    q = (text or "").lower()
+    labels = " ".join(str(s.get("label", "")).lower() for s in slots)
+    for name, abbr in DAY_ABBR.items():
+        if re.search(rf"\b{name}\b", q) and abbr not in labels:
+            return True
+    return False
+
 
 def select_slot(text: str, slots: list[dict]) -> dict | None:
     if not slots:
         return None
     q = (text or "").lower().strip()
-    for word in sorted(ORDINALS, key=len, reverse=True):
-        index = ORDINALS[word]
-        if re.search(rf"\b{re.escape(word)}\b", q) and index < len(slots):
-            return slots[index]
-    # Match an explicit clock time present in the server-provided label.
+    # An explicit clock time is unambiguous and must win over word ordinals:
+    # "the 10:00 one" means the 10:00 slot, not the first slot ("one").
     times = []
     for match in TIME_RE.finditer(q):
         hour = int(match.group(1))
@@ -47,8 +89,12 @@ def select_slot(text: str, slots: list[dict]) -> dict | None:
         times.append(f"{hour:02d}:{minute:02d}")
     for slot in slots:
         label = str(slot.get("label", ""))
-        if any(f"{t}" in label for t in times):
+        if any(t in label for t in times):
             return slot
+    for word in sorted(ORDINALS, key=len, reverse=True):
+        index = ORDINALS[word]
+        if re.search(rf"\b{re.escape(word)}\b", q) and index < len(slots):
+            return slots[index]
     return None
 
 
@@ -118,10 +164,32 @@ def result_message(result: dict, slot: dict, timezone: str) -> str:
     if status == "confirmed":
         return f"Your call is confirmed for {readback(slot, timezone)}. A calendar invitation has been sent."
     if status == "uncertain":
-        return "I couldn't verify whether that booking completed, so I'm not treating it as booked. Please contact James before trying again."
+        return (
+            "I couldn't verify whether that booking completed, so I'm not treating "
+            "it as booked. Say 'yes' and I'll check again with the same request, or "
+            "contact James before trying anything else."
+        )
     if status == "slot_unavailable":
         return "That time is no longer available. I won't book it; ask me for updated times."
     return "That booking could not be completed. I haven't confirmed anything; please try again or use the contact section."
+
+
+def parse_booking_response(status_code: int, body: object) -> dict:
+    """Map the portfolio `/api/booking` response onto the voice contract.
+
+    Success is claimed ONLY for the portfolio's confirmed contract: HTTP 200/201
+    **and** `status == "confirmed"`. A 2xx with any other body, an uncertain
+    (202), a taken slot (409), and every other status are never treated as
+    confirmed. Pure and testable; no I/O."""
+    data = body if isinstance(body, dict) else {}
+    status = data.get("status")
+    if status_code in (200, 201) and status == "confirmed":
+        return data
+    if status_code == 202 or status == "uncertain":
+        return {"status": "uncertain", "message": "The booking could not be confirmed."}
+    if status_code == 409 or status == "slot_unavailable":
+        return {"status": "slot_unavailable", "message": "That slot is no longer available."}
+    return {"status": "failed", "message": "The booking was not confirmed."}
 
 
 class VoiceBookingSession:
@@ -154,6 +222,13 @@ class VoiceBookingSession:
             self.idempotency = ""
         else:
             self.clear()
+
+    def mark_uncertain(self) -> None:
+        """A submission could not be verified. Keep the chosen slot, details,
+        and idempotency key so an explicit retry reconciles with the
+        portfolio's existing idempotency record instead of booking twice."""
+        if self.stage == "submitted":
+            self.stage = "confirm"
 
     def payload(self, timezone: str) -> dict[str, Any] | None:
         if not self.slot or not self.offer:
@@ -198,6 +273,15 @@ class VoiceBookingSession:
         """
         q = (text or "").strip()
         if not q or self.stage == "idle":
+            return None, None
+        # A subject change or explicit restart abandons the booking flow so the
+        # normal RAG answer is used. A clear confirmation never trips this.
+        if self.stage != "idle" and (
+            wants_restart(q)
+            or (looks_like_topic_change(q) and not wants_confirm(q) and not parse_email(q))
+            or (not wants_confirm(q) and mentions_unoffered_weekday(q, (self.offer or {}).get("slots") or []))
+        ):
+            self.clear()
             return None, None
         if self.stage == "select":
             if wants_cancel(q):

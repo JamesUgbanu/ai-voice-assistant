@@ -30,6 +30,8 @@ from .partial_stt import PartialTranscriber
 from .conversation_end import CallLifecycle, classify_completion, ending_wait_seconds
 from .greeting import greeting_reply
 from .history import append_turn, clean_history
+from .responder import HttpResponder
+from .widget_token import verify_widget_token
 from .protocol import (
     SERVER_CAPABILITIES,
     is_fatal_error,
@@ -168,9 +170,17 @@ async def http_client():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Fail fast with actionable messages instead of starting a service that
+    # cannot authenticate sessions or reach a conversational backend.
+    config_errors = settings.validation_errors()
+    if config_errors:
+        for message in config_errors:
+            event(logger, "config_error", error=message)
+        raise RuntimeError("Invalid voice-service configuration: " + "; ".join(config_errors))
     db()  # ensure schema exists before serving
     event(logger, "voice_startup", models="lazy", db=settings.db_path,
-          tts_mode=settings.tts_mode, tts_ref_configured=bool(settings.tts_voice_ref))
+          tts_mode=settings.tts_mode, tts_ref_configured=bool(settings.tts_voice_ref),
+          responder=settings.responder)
     # Warm the models in the background so the first turn is not cold.
     warm_task = asyncio.create_task(warm_models())
     yield
@@ -189,7 +199,7 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "X-Voice-Ticket"],
+        allow_headers=["Content-Type", "X-Voice-Ticket", "X-Widget-Token"],
         allow_credentials=True,
         max_age=600,
     )
@@ -235,15 +245,62 @@ def create_app() -> FastAPI:
         visitor_id = body.get("visitor_id") if isinstance(body.get("visitor_id"), str) else ""
         if not auth.is_valid_id(visitor_id):
             visitor_id = auth.new_visitor_id()
+
+        # Optional first-party widget auth. A supplied token must always be
+        # valid; "required" mode rejects anonymous session creation. With no
+        # token (the portfolio's in-page widget), behavior is unchanged.
+        widget_token = request.headers.get("x-widget-token", "")
+        claims = (
+            verify_widget_token(
+                settings.widget_token_secret,
+                widget_token,
+                now=now,
+                audience="widget",
+                required_scope="widget:voice",
+            )
+            if widget_token
+            else None
+        )
+        if widget_token and claims is None:
+            metric("sessions_rejected_token")
+            return JSONResponse(
+                {"error": {"code": "unauthorized", "message": "Widget token invalid or expired."}},
+                status_code=401,
+            )
+        if settings.widget_auth_mode == "required" and claims is None:
+            metric("sessions_rejected_token")
+            return JSONResponse(
+                {"error": {"code": "unauthorized", "message": "A valid widget token is required."}},
+                status_code=401,
+            )
+        project = ""
+        if claims is not None:
+            project = str(claims.get("project") or "")
+            if settings.widget_allowed_projects and project not in settings.widget_allowed_projects:
+                return JSONResponse(
+                    {"error": {"code": "unauthorized", "message": "Widget project is not allowed."}},
+                    status_code=403,
+                )
+            request_origin = request.headers.get("origin", "")
+            if claims.get("origin") and claims.get("origin") != request_origin:
+                return JSONResponse(
+                    {"error": {"code": "unauthorized", "message": "Widget token origin mismatch."}},
+                    status_code=403,
+                )
+        # Project-scoped keys isolate sessions/quotas without changing the
+        # existing anonymous identifiers used by the portfolio.
+        scope = f"{project}:" if project else ""
+        attempt_key = f"{scope}{ip_hash}"
+        session_visitor_id = f"{scope}{visitor_id}"
         try:
             await db_call(
                 store.record_attempt,
-                ip_hash,
+                attempt_key,
                 now,
                 settings.attempt_window_seconds,
             )
             attempts = await db_call(
-                store.count_attempts, ip_hash, now, settings.attempt_window_seconds
+                store.count_attempts, attempt_key, now, settings.attempt_window_seconds
             )
         except Exception:
             return JSONResponse({"error": {"code": "server_error", "message": "Try again shortly."}}, status_code=500)
@@ -256,8 +313,8 @@ def create_app() -> FastAPI:
         try:
             row = await db_call(
                 store.create_session,
-                visitor_id=visitor_id,
-                ip_hash=ip_hash,
+                visitor_id=session_visitor_id,
+                ip_hash=attempt_key,
                 now=now,
                 max_seconds=settings.max_call_seconds,
                 daily_allowance_seconds=settings.daily_allowance_seconds,
@@ -659,6 +716,19 @@ async def _handle_socket(websocket: WebSocket) -> None:
     history: list[dict] = clean_history(payload.get("history"))
     # Session-local voice booking state; never shared across WebSockets.
     booking = booking_flow.VoiceBookingSession()
+    # The generic HTTP responder is optional; the portfolio adapter below is
+    # the default and preserves the existing RAG/booking contract.
+    http_responder = (
+        HttpResponder(
+            url=settings.responder_url,
+            token=settings.responder_token,
+            timeout_seconds=settings.responder_timeout_seconds,
+            session_id=session_id,
+            client_factory=http_client,
+        )
+        if settings.responder == "http"
+        else None
+    )
     last_ping_at = 0.0
     started_at = float(row["started_at"])
     max_seconds = int(row["max_seconds"])
@@ -814,87 +884,100 @@ async def _handle_socket(websocket: WebSocket) -> None:
         turn_cancel = asyncio.Event()
         await send(make_envelope("rag_started", {"turn_id": turn_id}))
 
-        async def rag_ask(text: str) -> str:
-            client = await http_client()
-            from . import rag_client as rc
-
-            out = await rc.fetch_answer(
-                client,
-                settings.rag_api_url,
-                settings.rag_service_token,
-                text,
-                history=list(history),
-                timeout_seconds=settings.rag_timeout_seconds,
-            )
-            return out.text
-
-        # Per-turn TTFB sink: the RAG stream writes request→first-body-byte here.
-        # Scoped to this turn (a fresh dict per utterance) so concurrent turns
-        # can never overwrite each other's timing.
+        # Per-turn TTFB sink: the portfolio RAG stream writes request→first-body-
+        # byte here. A fresh dict per utterance keeps concurrent turns isolated.
         ttfb_out: dict = {}
 
-        async def call_booking_api(payload: dict) -> dict:
-            if not settings.booking_api_url:
-                return {"status": "failed", "message": "Voice booking is not configured."}
-            try:
-                client = await http_client()
-                response = await client.post(
-                    settings.booking_api_url,
-                    json=payload,
-                    timeout=settings.booking_timeout_seconds,
+        if http_responder is not None:
+            # Generic application backend. It receives the finalized utterance,
+            # bounded history, and session id, and streams plain answer text.
+            async def rag_ask(text: str) -> str:
+                return await http_responder.ask(text, list(history))
+
+            def rag_stream(text: str):
+                stop_event = turn_cancel
+                return http_responder.stream(
+                    text,
+                    list(history),
+                    should_stop=(lambda: stop_event.is_set()) if stop_event else None,
                 )
+        else:
+            async def rag_ask(text: str) -> str:
+                client = await http_client()
+                from . import rag_client as rc
+
+                out = await rc.fetch_answer(
+                    client,
+                    settings.rag_api_url,
+                    settings.rag_service_token,
+                    text,
+                    history=list(history),
+                    timeout_seconds=settings.rag_timeout_seconds,
+                )
+                return out.text
+
+            async def call_booking_api(payload: dict) -> dict:
+                if not settings.booking_api_url:
+                    return {"status": "failed", "message": "Voice booking is not configured."}
                 try:
-                    body = response.json()
+                    client = await http_client()
+                    response = await client.post(
+                        settings.booking_api_url,
+                        json=payload,
+                        timeout=settings.booking_timeout_seconds,
+                    )
+                    try:
+                        body = response.json()
+                    except Exception:
+                        body = {}
+                    # Single source of truth for the confirmed contract: only
+                    # 200/201 with status == "confirmed" may be announced.
+                    return booking_flow.parse_booking_response(response.status_code, body)
                 except Exception:
-                    body = {}
-                if not isinstance(body, dict):
-                    body = {}
-                if response.status_code in (200, 201) and body.get("status") == "confirmed":
-                    return body
-                if response.status_code == 202 or body.get("status") == "uncertain":
-                    return {"status": "uncertain", "message": "The booking could not be confirmed."}
-                if response.status_code == 409 or body.get("status") == "slot_unavailable":
-                    return {"status": "slot_unavailable", "message": "That slot is no longer available."}
-                return {"status": "failed", "message": "The booking was not confirmed."}
-            except Exception:
-                # A timeout is uncertain: the event may exist. Never speak a
-                # confirmation. The portfolio reconciles by idempotency key.
-                return {"status": "uncertain", "message": "The booking request timed out."}
+                    # A timeout is uncertain: the event may exist. Never speak a
+                    # confirmation. The session keeps the idempotency key so a
+                    # retry reconciles instead of creating a second booking.
+                    return {"status": "uncertain", "message": "The booking request timed out."}
 
-        def capture_booking(data: dict) -> None:
-            booking.capture_offer(data)
+            def capture_booking(data: dict) -> None:
+                booking.capture_offer(data)
 
-        async def rag_stream(text: str):
-            # Pending voice booking turns are deterministic; unrelated turns
-            # fall through to ordinary RAG.
-            reply, payload = booking.handle(text, settings.booking_timezone)
-            if reply is not None:
-                yield reply
-                return
-            if payload is not None:
-                result = await call_booking_api(payload)
-                message = booking_flow.result_message(result, booking.slot or {}, settings.booking_timezone)
-                booking.clear()
-                yield message
-                return
-            client = await http_client()
-            from . import rag_client as rc
+            async def rag_stream(text: str):
+                # Pending voice booking turns are deterministic; unrelated turns
+                # fall through to ordinary RAG.
+                reply, payload = booking.handle(text, settings.booking_timezone)
+                if reply is not None:
+                    yield reply
+                    return
+                if payload is not None:
+                    result = await call_booking_api(payload)
+                    message = booking_flow.result_message(result, booking.slot or {}, settings.booking_timezone)
+                    if result.get("status") == "uncertain":
+                        # Keep the key/details reachable so an explicit retry
+                        # reconciles with the portfolio instead of double-booking.
+                        booking.mark_uncertain()
+                    else:
+                        booking.clear()
+                    yield message
+                    return
+                client = await http_client()
+                from . import rag_client as rc
 
-            stop_event = turn_cancel
-            async for chunk in rc.iter_answer(
-                client,
-                settings.rag_api_url,
-                settings.rag_service_token,
-                text,
-                history=list(history),
-                timeout_seconds=settings.rag_timeout_seconds,
-                should_stop=(lambda: stop_event.is_set()) if stop_event else None,
-                mode="voice",
-                time_zone=settings.booking_timezone,
-                on_booking=capture_booking,
-                on_ttfb=lambda ms: ttfb_out.__setitem__("ms", ms),
-            ):
-                yield chunk
+                stop_event = turn_cancel
+                async for chunk in rc.iter_answer(
+                    client,
+                    settings.rag_api_url,
+                    settings.rag_service_token,
+                    text,
+                    history=list(history),
+                    timeout_seconds=settings.rag_timeout_seconds,
+                    should_stop=(lambda: stop_event.is_set()) if stop_event else None,
+                    mode="voice",
+                    time_zone=settings.booking_timezone,
+                    on_booking=capture_booking,
+                    on_ttfb=lambda ms: ttfb_out.__setitem__("ms", ms),
+                ):
+                    yield chunk
 
         async def emit_frame(pcm_bytes: bytes, final: bool) -> None:
             if not state.is_current(turn_id):
@@ -947,6 +1030,11 @@ async def _handle_socket(websocket: WebSocket) -> None:
             )
         except asyncio.CancelledError:
             return
+        # A superseded/cancelled turn may have submitted a booking whose
+        # outcome we never observed. Keep the idempotency key so the next
+        # explicit confirmation reconciles rather than booking twice.
+        if result.cancelled:
+            booking.mark_uncertain()
         if decision is not None:
             decision["frames"] = result.audio_frames
         # Stage-by-stage timing for one turn (monotonic durations, no PII).

@@ -73,6 +73,73 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(Settings(env={"VOICE_TTS_LISTEN_MAX_CHARS": "99999"}).tts_listen_max_chars, 3000)
         self.assertEqual(Settings(env={}).tts_per_minute, 12)
 
+    def test_responder_selection_and_timeout_bounds(self):
+        self.assertEqual(Settings(env={}).responder, "portfolio")
+        self.assertEqual(Settings(env={"VOICE_RESPONDER": "HTTP"}).responder, "http")
+        self.assertEqual(Settings(env={}).responder_timeout_seconds, 25)
+        self.assertEqual(
+            Settings(env={"VOICE_RESPONDER_TIMEOUT_SECONDS": "1"}).responder_timeout_seconds, 5
+        )
+        self.assertEqual(
+            Settings(env={"VOICE_RESPONDER_TIMEOUT_SECONDS": "999"}).responder_timeout_seconds, 120
+        )
+
+    def test_startup_validation_is_actionable_and_never_includes_secrets(self):
+        missing = Settings(env={}).validation_errors()
+        self.assertTrue(any("VOICE_HMAC_SECRET" in e for e in missing))
+        self.assertTrue(any("VOICE_RAG_API_URL" in e for e in missing))
+
+        portfolio_ok = Settings(env={
+            "VOICE_HMAC_SECRET": "x" * 32,
+            "VOICE_RAG_API_URL": "https://example.test/api/rag",
+            "VOICE_RAG_SERVICE_TOKEN": "token",
+        })
+        self.assertEqual(portfolio_ok.validation_errors(), [])
+
+        http_missing = Settings(env={"VOICE_HMAC_SECRET": "x" * 32, "VOICE_RESPONDER": "http"})
+        self.assertTrue(any("VOICE_RESPONDER_URL" in e for e in http_missing.validation_errors()))
+        http_ok = Settings(env={
+            "VOICE_HMAC_SECRET": "x" * 32,
+            "VOICE_RESPONDER": "http",
+            "VOICE_RESPONDER_URL": "https://example.test/respond",
+        })
+        self.assertEqual(http_ok.validation_errors(), [])
+
+        invalid = Settings(env={"VOICE_HMAC_SECRET": "x" * 32, "VOICE_RESPONDER": "nope"})
+        self.assertTrue(any("must be 'portfolio' or 'http'" in e for e in invalid.validation_errors()))
+
+        clone = Settings(env={
+            "VOICE_HMAC_SECRET": "x" * 32,
+            "VOICE_RAG_API_URL": "https://example.test/api/rag",
+            "VOICE_RAG_SERVICE_TOKEN": "token",
+            "VOICE_TTS_MODE": "clone",
+        })
+        self.assertTrue(any("VOICE_TTS_VOICE_REF" in e for e in clone.validation_errors()))
+        self.assertFalse(any("x" * 32 in e for e in clone.validation_errors()))
+
+    def test_widget_auth_defaults_and_validation(self):
+        self.assertEqual(Settings(env={}).widget_auth_mode, "anonymous")
+        base = {
+            "VOICE_HMAC_SECRET": "x" * 32,
+            "VOICE_RAG_API_URL": "https://example.test/api/rag",
+            "VOICE_RAG_SERVICE_TOKEN": "token",
+        }
+        required = Settings(env={**base, "VOICE_WIDGET_AUTH_MODE": "required"})
+        self.assertTrue(any("VOICE_WIDGET_TOKEN_SECRET" in e for e in required.validation_errors()))
+        ok = Settings(env={
+            **base,
+            "VOICE_WIDGET_AUTH_MODE": "required",
+            "VOICE_WIDGET_TOKEN_SECRET": "s" * 32,
+        })
+        self.assertEqual(ok.validation_errors(), [])
+        short = Settings(env={
+            **base,
+            "VOICE_WIDGET_TOKEN_SECRET": "short",
+        })
+        self.assertTrue(any("at least 32" in e for e in short.validation_errors()))
+        invalid = Settings(env={**base, "VOICE_WIDGET_AUTH_MODE": "nope"})
+        self.assertTrue(any("must be 'anonymous' or 'required'" in e for e in invalid.validation_errors()))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,20 +1,31 @@
 # Keep private recordings and local state out of the image build context.
-# The Dockerfile COPYs pyproject.toml, app/, and (Option A) the one authorized
+# The Dockerfile COPYs pyproject.toml, app/, and optionally one authorized
 # reference at deploy/reference/voice-ref.wav. Everything else with private
 # audio is excluded; the reference is re-included explicitly below.
 .env
 .git
+.github
 .gitignore
+.venv
+venv
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+dist/
 data/
 models/
+docs/
+examples/
+infra/
+scripts/
+tests/
 voice-reference/
 voices/
+whisper-captures/
 *.wav
 *.mp3
-P2*-REPORT.md
-tests/
-# Option A: the authorized reference is baked into the PRIVATE image at the
-# runtime path. It is git-ignored and only ever included in the private build.
+# The reference directory must exist in the build context even on a clean
+# checkout (it contains .gitkeep). Only the authorized WAV is re-included.
+!deploy/reference/.gitkeep
 !deploy/reference/voice-ref.wav

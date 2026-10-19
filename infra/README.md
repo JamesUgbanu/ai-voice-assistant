@@ -1,5 +1,10 @@
 # Voice-service infrastructure (`infra/`)
 
+> **Reference infrastructure (portfolio-specific).** The defaults and the
+> example `terraform.tfvars.example` reference the original deployment.
+> Replace names, domains, network ranges, and account-specific values before
+> using this with another application.
+
 Terraform for the **`james-voice-service`** host on **Hetzner Cloud**, designed
 so the *application deployment* stays provider-neutral and a future VPS provider
 can be added without rewriting the voice service.
@@ -214,7 +219,7 @@ Defaults are starting points; see §7 for sizing rationale. All are validated.
 traffic**: the stack fits only narrowly on paper, with no headroom, and nothing
 was ever measured on the target host or on ARM. Inference is CPU-bound — TTS
 RTF drops below 1× under contention, which is the measured "choppy audio" cause
-(`docs/VOICE-RESOURCE-AUDIT.md`). Memory and CPU both bind on a 2 GB / 1 vCPU
+Memory and CPU both bind on a 2 GB / 1 vCPU
 box.
 
 ### Defaults chosen here

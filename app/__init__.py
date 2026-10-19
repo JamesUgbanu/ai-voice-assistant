@@ -1,6 +1,7 @@
-"""James voice service: self-hosted realtime English voice for jamesugbanu.com.
+"""Self-hosted realtime voice service.
 
-Separate project, separate server, separate deploy. The portfolio RAG API
-remains the sole knowledge source; this service owns microphone audio,
-STT, TTS, turn state, sessions, and quotas — nothing else.
+Audio transport, speech recognition, turn lifecycle, and speech synthesis.
+A pluggable responder connects it to a conversational backend; the portfolio
+RAG adapter is the reference deployment. The service owns microphone audio,
+STT, TTS, turn state, sessions, and quotas — not the application's knowledge.
 """

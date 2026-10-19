@@ -22,6 +22,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./
+# The package must exist for the editable install metadata. The rest of app/
+# is copied after dependencies so routine code changes do not invalidate the
+# (slow) dependency layer.
+COPY app/__init__.py ./app/__init__.py
 # CPU-only torch: the default PyPI index serves multi-GB CUDA wheels that
 # this CPU service never uses. Install CPU torch explicitly first.
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch && \
@@ -29,13 +33,18 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
 
 COPY app ./app
 
-# Option A (authorized): bake the authorized voice-cloning reference into the
-# PRIVATE image at the exact runtime path. PRIVACY TRADE-OFF: anyone able to
-# pull this image can extract and reuse the biometric reference. The registry
-# must stay private with tightly restricted, read-only pull access; the file is
-# git-ignored and never logged. Placed before the chown so it is owned by the
-# non-root runtime user.
-COPY deploy/reference/voice-ref.wav /srv/voice/voice-reference/processed/voice-ref.wav
+# Optional voice-cloning reference. The original deployment stages an
+# authorized recording at deploy/reference/voice-ref.wav (Git-ignored) and
+# builds a PRIVATE image that bakes it in. A clean public checkout has only
+# deploy/reference/.gitkeep, so the copy is skipped and preset TTS is used.
+# PRIVACY: anyone able to pull an image containing the reference can extract
+# it. Keep any such image private and do not use it for a third party's voice.
+COPY deploy/reference/ /tmp/voice-reference/
+RUN if [ -f /tmp/voice-reference/voice-ref.wav ]; then \
+        mkdir -p /srv/voice/voice-reference/processed && \
+        cp /tmp/voice-reference/voice-ref.wav /srv/voice/voice-reference/processed/voice-ref.wav; \
+    fi; \
+    rm -rf /tmp/voice-reference
 
 RUN getent group voice >/dev/null || groupadd -r voice; \
     id -u voice >/dev/null 2>&1 || useradd -r -g voice --create-home --shell /usr/sbin/nologin voice && \

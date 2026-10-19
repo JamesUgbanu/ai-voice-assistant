@@ -1,7 +1,16 @@
 .env
+.venv/
+venv/
 __pycache__/
 *.pyc
+*.egg-info/
+.eggs/
+build/
+dist/
 .pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 data/
 models/
 *.sqlite3
@@ -18,10 +27,12 @@ voices/
 voice-reference/original/
 voice-reference/processed/
 voice-reference/output/
-# Option A: authorized reference staged for the PRIVATE image build only.
-deploy/reference/
+# Authorized reference staged for a PRIVATE image build only. Keep the empty
+# directory in Git so a clean checkout can build a preset-voice image.
+deploy/reference/*
+!deploy/reference/.gitkeep
 
-# Temporary P2Y diagnostic captures (exact Whisper inputs). Local only;
-# delete the directory contents after the investigation.
+# Temporary diagnostic captures (exact Whisper inputs). Local only; never
+# commit and delete the contents after an investigation.
 whisper-captures/
 ssh/

@@ -116,7 +116,7 @@ cloned voice. To use the authorized reference on the host:
    `"tts": {"mode": "clone", "ref_configured": true, "cloning_active": true}`.
    If `cloning_active` is false, the clone weights/terms are not loaded or the
    reference file is missing; the adapter raises rather than substituting a
-   generic voice (see `docs/P2F-NIGERIAN-ACCENT-REPORT.md` for the measured
+   generic voice (see the README's model notes for the measured
    fidelity limit of this model).
 4. Rollback: set `VOICE_TTS_MODE=preset` (or unset it) and recreate — no code
    change. This is independent of streaming STT (`VOICE_STT_STREAMING`).

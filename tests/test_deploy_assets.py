@@ -85,12 +85,15 @@ class ComposeTest(unittest.TestCase):
 
 
 class ReferenceBakeTest(unittest.TestCase):
-    """Option A: the authorized reference is baked into the PRIVATE image."""
+    """Optional authorized reference baked into a PRIVATE image."""
 
     def test_dockerfile_bakes_reference_at_runtime_path(self):
         src = read("Dockerfile")
+        self.assertIn("COPY deploy/reference/ /tmp/voice-reference/", src)
+        self.assertIn("if [ -f /tmp/voice-reference/voice-ref.wav ]", src)
         self.assertIn(
-            "COPY deploy/reference/voice-ref.wav /srv/voice/voice-reference/processed/voice-ref.wav",
+            "cp /tmp/voice-reference/voice-ref.wav "
+            "/srv/voice/voice-reference/processed/voice-ref.wav",
             src,
         )
 
@@ -99,9 +102,12 @@ class ReferenceBakeTest(unittest.TestCase):
         self.assertIn("voice-reference/", src)
         self.assertIn("*.wav", src)
         self.assertIn("!deploy/reference/voice-ref.wav", src)
+        self.assertIn("!deploy/reference/.gitkeep", src)
 
     def test_gitignore_keeps_reference_out_of_git(self):
-        self.assertIn("deploy/reference/", read(".gitignore"))
+        src = read(".gitignore")
+        self.assertIn("deploy/reference/*", src)
+        self.assertIn("!deploy/reference/.gitkeep", src)
 
     def test_release_refuses_missing_or_untracked_reference(self):
         src = read("scripts/release.sh")

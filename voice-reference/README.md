@@ -50,4 +50,4 @@ Cloning requires the **gated** `kyutai/pocket-tts` weights (accept the model
 terms and authenticate Hugging Face). Without them the model loads its
 non-cloning fallback and any custom reference is rejected with an actionable
 error — the service never substitutes a generic voice and calls it cloned.
-See `VOICE_TTS_MODE` in `.env.example` and `../docs/P2C-REPORT.md`.
+See `VOICE_TTS_MODE` in `.env.example` and the root `README.md`.

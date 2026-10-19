@@ -26,6 +26,40 @@ class MainWiringTest(unittest.TestCase):
         self.assertIn("booking_flow", self.imported)
         self.assertIn("clean_history(payload.get(\"history\"))", self.source)
 
+    def test_each_turn_forwards_history_and_voice_mode(self):
+        # Both the streaming and non-streaming RAG calls carry the session's
+        # bounded history; the current utterance is not pre-appended.
+        self.assertIn("history=list(history)", self.source)
+        self.assertIn('mode="voice"', self.source)
+        self.assertIn("append_turn(history, result.transcript, result.answer_text)", self.source)
+
+    def test_uncertain_booking_retains_idempotency(self):
+        # Never confirm an uncertain outcome; keep the key for a safe retry.
+        self.assertIn("booking_flow.parse_booking_response", self.source)
+        self.assertIn('result.get("status") == "uncertain"', self.source)
+        self.assertIn("booking.mark_uncertain()", self.source)
+
+    def test_generic_responder_is_opt_in_and_does_not_replace_the_portfolio_path(self):
+        self.assertIn("HttpResponder", self.source)
+        self.assertIn('settings.responder == "http"', self.source)
+        self.assertIn("http_responder.stream(", self.source)
+        # The portfolio RAG/booking path remains the default branch.
+        self.assertIn("rc.iter_answer(", self.source)
+        self.assertIn("booking.handle(", self.source)
+        # Startup validation must run before serving.
+        self.assertIn("settings.validation_errors()", self.source)
+        self.assertIn("Invalid voice-service configuration", self.source)
+
+    def test_widget_tokens_are_optional_and_project_scoped(self):
+        self.assertIn("verify_widget_token", self.source)
+        self.assertIn('request.headers.get("x-widget-token", "")', self.source)
+        self.assertIn("session_visitor_id", self.source)
+        self.assertIn("f\"{scope}{visitor_id}\"", self.source)
+        self.assertIn("settings.widget_auth_mode", self.source)
+        # The browser session POST carries the widget token, so the CORS
+        # preflight must allow that header.
+        self.assertIn('"X-Widget-Token"', self.source)
+
     def test_typed_turn_uses_the_same_pipeline_without_stt(self):
         self.assertIn('etype == "text_message"', self.source)
         self.assertIn("text_input=text_", self.source)

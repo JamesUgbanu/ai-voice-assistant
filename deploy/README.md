@@ -1,5 +1,10 @@
 # Voice service — production deployment and operations runbook
 
+> **Reference deployment (portfolio-specific).** This runbook describes the
+> original scheduled deployment. Replace the GitHub owner, domains, DNS
+> records, SSM paths, and secrets before adapting it. It is not required to
+> use the voice service.
+
 This is the authoritative runbook for the scheduled, disposable Hetzner
 deployment. The root `DEPLOY.md` describes an older long-lived-Compose setup and
 is **not** the production path.
@@ -305,57 +310,6 @@ Verified on 2026-10-17:
   tunnels and 50,000 routes. One tunnel and one public hostname are sufficient.
 - WebSockets are supported on all plans; enable **Network → WebSockets**. The
   voice client sends continuous audio frames; add a heartbeat if idle gaps occur.
-### Historical migration record (completed; retained for rebuilds)
-
-Pre-migration DNS (Spaceship; `launch1/2.spaceship.net`; authoritative export):
-  - apex `A 216.198.79.1` (Vercel)
-  - `agents CNAME be59e0e2c8e0cc4a.vercel-dns-017.com` (Vercel)
-  - `www CNAME 0a1aaae9e1aafbb7.vercel-dns-017.com` (Vercel)
-  - `mail CNAME mail-jamesugbanu-com.brand.brevosend.com` (Brevo)
-  - `img.mail CNAME mail-jamesugbanu-com.img.brand.brevosend.com` (Brevo)
-  - `r.mail CNAME mail-jamesugbanu-com.r.brand.brevosend.com` (Brevo)
-  - `brevo1._domainkey CNAME b1.jamesugbanu-com.dkim.brevo.com` (Brevo DKIM)
-  - `brevo2._domainkey CNAME b2.jamesugbanu-com.dkim.brevo.com` (Brevo DKIM)
-  - TXT apex: `brevo-code:…`, `google-site-verification=…`
-  - TXT `_dmarc`: `v=DMARC1; p=none; rua=mailto:rua@dmarc.brevo.com`
-  - No apex MX, CAA, or AAAA found; the Spaceship export above is authoritative.
-- `mail` is a **CNAME**, not an NS delegation. `dig NS mail` follows the CNAME
-  chain into Brevo's zone, which is why it appeared delegated. Do not add NS
-  records for `mail`.
-
-### Historical migration procedure (completed; use only for a rebuild with explicit approval)
-
-1. Add `jamesugbanu.com` to Cloudflare (Free). Review the imported records
-   against the Spaceship export; add anything the scan missed (`agents`,
-   `img.mail`, `r.mail`). Preserve every email/verification/DKIM/DMARC record.
-   Keep apex, Vercel, Brevo and DKIM records **DNS-only** (grey cloud); never
-   proxy mail/DKIM/Vercel records.
-2. Confirm the two assigned Cloudflare nameservers and the complete record set.
-3. Change the nameservers at Spaceship to the Cloudflare pair. Keep the
-   Spaceship zone intact for rollback. Verify with
-   `dig NS jamesugbanu.com @1.1.1.1`.
-4. After activation, enable Network → WebSockets, then run on the Mac:
-   ```bash
-   cloudflared tunnel login
-   cloudflared tunnel create james-voice
-   cloudflared tunnel route dns james-voice voice.jamesugbanu.com
-   ```
-   Config ingress: `voice.jamesugbanu.com → http://voice:8000`; route only
-   `/v1/sessions`, `/v1/voice`, `/healthz`, `/v1/transcribe`, and
-   `/v1/transcribe/ticket`; fallback `404` keeps `/metrics` private.
-   The route creates a proxied CNAME to `<tunnel-id>.cfargotunnel.com`.
-5. Store the tunnel credentials JSON in SSM `/voice/cloudflared-credentials`
-   (SecureString); add Lambda read access; run `cloudflare/cloudflared` in the
-   bootstrap on a Docker network with the app. No inbound ports, no Caddy.
-6. For a rebuild, present a revised Terraform plan before applying or provisioning.
-
-Rollback (only for a deliberate migration reversal): revert the nameservers at
-Spaceship to `launch1/launch2.spaceship.net`; the original zone remains
-unchanged. Removing the tunnel would remove production ingress.
-
-Keep the retained Primary IPv4 for SSH/operations; it is not used for public
-ingress once the tunnel is active.
-
 ## 12. First provision and live verification
 
 After the image, SSM values, IP, Terraform apply, and Cloudflare Tunnel are ready:
