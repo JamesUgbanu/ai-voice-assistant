@@ -269,19 +269,24 @@ class IncrementalTurnTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_timings_capture_first_audio_and_total(self):
         s, tid = collecting()
+        tick = {"t": 0}
+
+        def now_ms():
+            tick["t"] += 100
+            return tick["t"]
+
         res, tim = await run_turn(
             state=s, turn_id=tid, audio=b"\x10\x00" * 800, cancelled=asyncio.Event(),
             stt=self.stt, stt_config=SttConfig(), vad=self.vad, vad_threshold=0.0,
             rag_ask=lambda q: None,
             rag_stream=lambda q: stream_of(["Hello world. ", "Second sentence."]),
             tts=self.tts, tts_config=TtsConfig(),
-            emit_audio_frame=self._emit, now_ms=lambda: int(time.monotonic() * 1000),
+            emit_audio_frame=self._emit, now_ms=now_ms,
         )
         self.assertIsNone(res.error)
         self.assertGreater(tim.first_audio_ms, 0)
         self.assertGreaterEqual(tim.total_ms, tim.first_audio_ms)
         self.assertGreater(tim.rag_ms, 0)
-
 
     async def test_slow_consumer_applies_backpressure_without_loss(self):
         # 200 chunks > the bounded queue (64): the producer must block and the

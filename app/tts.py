@@ -175,7 +175,7 @@ class PocketTtsBackend(TtsBackend):
     def __init__(self) -> None:
         self._model = None
         self._voice_state = None
-        self._voice_key = ""
+        self._voice_key: tuple | None = None
         self._has_cloning: bool | None = None
         self._cloning_active = False
         self._mode = "preset"
@@ -188,24 +188,48 @@ class PocketTtsBackend(TtsBackend):
         if self._model is None:
             self._model = TTSModel.load_model()
             self._has_cloning = bool(getattr(self._model, "has_voice_cloning", False))
-        key = f"{config.mode}:{config.voice_ref if config.mode == 'clone' else config.preset_voice}"
+        if config.mode == "clone":
+            if not config.voice_ref:
+                raise VoiceCloningUnavailable(
+                    "clone mode requires VOICE_TTS_VOICE_REF to point at the prepared reference"
+                )
+            if not os.path.isfile(config.voice_ref):
+                raise VoiceCloningUnavailable(
+                    "VOICE_TTS_VOICE_REF does not point at a readable file"
+                )
+            try:
+                stat = os.stat(config.voice_ref)
+            except OSError as exc:
+                raise VoiceCloningUnavailable(
+                    "VOICE_TTS_VOICE_REF does not point at a readable file"
+                ) from exc
+            # Re-derive the voice state when the reference is replaced at the
+            # same path. The model caches conditioning by path, so a path-only
+            # key would keep speaking the old recording until a restart.
+            key = (
+                "clone",
+                config.voice_ref,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+                stat.st_size,
+                stat.st_ino,
+            )
+        else:
+            key = ("preset", config.preset_voice)
         if self._voice_state is None or self._voice_key != key:
             if config.mode == "clone":
-                if not config.voice_ref:
-                    raise VoiceCloningUnavailable(
-                        "clone mode requires VOICE_TTS_VOICE_REF to point at the prepared reference"
-                    )
-                if not os.path.isfile(config.voice_ref):
-                    raise VoiceCloningUnavailable(
-                        "VOICE_TTS_VOICE_REF does not point at a readable file"
-                    )
                 if not self._has_cloning:
                     raise VoiceCloningUnavailable(
                         "voice cloning needs the gated 'kyutai/pocket-tts' weights: accept the "
                         "model terms on Hugging Face and authenticate (HF_TOKEN). The loaded "
                         "model has no cloning support, so a custom voice cannot be used."
                     )
-                self._voice_state = self._model.get_state_for_audio_prompt(config.voice_ref)
+                # Pocket TTS caps conditioning at 30 s. Our prepared reference
+                # already is, but a raw/baked reference may be longer; truncate
+                # explicitly so the model never processes unbounded audio.
+                self._voice_state = self._model.get_state_for_audio_prompt(
+                    config.voice_ref, truncate=True
+                )
                 self._cloning_active = True
             else:
                 self._voice_state = self._model.get_state_for_audio_prompt(config.preset_voice)

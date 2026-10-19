@@ -206,6 +206,20 @@ python examples/voice_client.py --base http://127.0.0.1:8000 \
 See [`examples/README.md`](examples/README.md) for audio turns, saving
 synthesized audio, and seeding history.
 
+### 7. Container image
+
+Pushes to `main` publish a `linux/amd64` image to GitHub Container Registry:
+
+```text
+ghcr.io/jamesugbanu/ai-voice-assistant:<full-commit-sha>
+ghcr.io/jamesugbanu/ai-voice-assistant:latest
+```
+
+The image is built from a clean checkout, so it never contains `.env`, private
+reference audio, or model weights. Clone mode still needs the authorized
+reference mounted read-only and `HF_TOKEN` supplied at runtime. If the package
+is private, authenticate first with `docker login ghcr.io`.
+
 ## Configuration
 
 | Variable | Required | Purpose |

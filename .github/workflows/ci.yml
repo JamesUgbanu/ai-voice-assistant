@@ -27,3 +27,67 @@ jobs:
           python -m pip install --no-deps -e .
       - name: Unit tests (stdlib only)
         run: python -m unittest discover -s tests -v
+
+  publish:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure private audio and secrets are absent
+        run: |
+          test ! -e deploy/reference/voice-ref.wav
+          test ! -e .env
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=${{ github.sha }}
+            type=raw,value=latest,enable={{is_default_branch}}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Verify pushed image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker pull "$image@$DIGEST"
+          docker run --rm --entrypoint sh "$image@$DIGEST" -c \
+            'test ! -e /srv/voice/voice-reference/processed/voice-ref.wav'
+          docker run -d --name voice-publish-smoke \
+            -e VOICE_USE_STUBS=1 \
+            -e "VOICE_HMAC_SECRET=$(openssl rand -hex 32)" \
+            -e VOICE_RESPONDER=http \
+            -e VOICE_RESPONDER_URL=http://127.0.0.1:9/ \
+            -p 18000:8000 "$image@$DIGEST"
+          trap 'docker rm -f voice-publish-smoke >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18000/healthz >/tmp/health.json; then
+              break
+            fi
+            sleep 1
+          done
+          cat /tmp/health.json
+          grep -q '"status":"ok"' /tmp/health.json
+          grep -q '"db":true' /tmp/health.json
+          echo "image: $image@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          echo "tags: ${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"

@@ -51,13 +51,15 @@ class FakeModel:
     def __init__(self, has_cloning=True, delay=0.0):
         self.has_voice_cloning = has_cloning
         self.state_calls = []
+        self.state_kwargs = []
         self.gen_calls = []
         self.delay = delay
         self._active = 0
         self.max_active = 0
 
-    def get_state_for_audio_prompt(self, source):
+    def get_state_for_audio_prompt(self, source, truncate=False):
         self.state_calls.append(source)
+        self.state_kwargs.append({"truncate": truncate})
         if source.endswith(".wav") and not self.has_voice_cloning:
             raise ValueError("voice cloning unsupported")
         return {"voice": source}
@@ -110,6 +112,7 @@ class AdapterTest(unittest.TestCase):
         b = PocketTtsBackend()
         b.synthesize_full("hello there", TtsConfig(mode="preset", preset_voice="alba"))
         self.assertEqual(m.state_calls, ["alba"])
+        self.assertEqual(m.state_kwargs, [{"truncate": False}])
         d = b.describe()
         self.assertEqual(d["mode"], "preset")
         self.assertFalse(d["cloning_active"])
@@ -142,8 +145,23 @@ class AdapterTest(unittest.TestCase):
         out2 = b.synthesize_full("two", cfg)
         self.assertIsInstance(out1, bytes)
         self.assertEqual(len(m.state_calls), 1)  # prepared once, reused
+        self.assertEqual(m.state_kwargs, [{"truncate": True}])
         self.assertEqual(m.gen_calls, ["one", "two"])
         self.assertTrue(b.describe()["cloning_active"])
+
+    def test_replacing_reference_at_same_path_reloads_voice_state(self):
+        m = FakeModel(has_cloning=True)
+        install_fake_pocket(m)
+        b = PocketTtsBackend()
+        cfg = TtsConfig(mode="clone", voice_ref=self.tmp.name)
+        b.synthesize_full("one", cfg)
+        with open(self.tmp.name, "wb") as handle:
+            handle.write(b"changed reference")
+        stat = os.stat(self.tmp.name)
+        os.utime(self.tmp.name, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        b.synthesize_full("two", cfg)
+        self.assertEqual(len(m.state_calls), 2)
+        self.assertEqual(m.state_kwargs, [{"truncate": True}, {"truncate": True}])
 
     def test_switching_mode_reuses_distinct_states(self):
         m = FakeModel(has_cloning=True)
