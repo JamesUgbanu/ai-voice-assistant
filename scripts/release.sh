@@ -16,7 +16,7 @@ set -euo pipefail
 
 VERSION="${VERSION:-}"
 OWNER="${GHCR_OWNER:-}"
-IMAGE_NAME="${IMAGE_NAME:-james-voice-service}"
+IMAGE_NAME="${IMAGE_NAME:-voice-service}"
 PLATFORM="${PLATFORM:-linux/amd64}"   # Hetzner server is amd64 (verify if ARM)
 BUILDER="${BUILDER:-desktop-linux}"   # trusted LOCAL builder (never a remote builder)
 STABLE=""

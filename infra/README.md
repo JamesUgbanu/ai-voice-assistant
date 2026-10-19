@@ -5,7 +5,14 @@
 > Replace names, domains, network ranges, and account-specific values before
 > using this with another application.
 
-Terraform for the **`james-voice-service`** host on **Hetzner Cloud**, designed
+> **Rename compatibility note.** This module now belongs to AI Voice Assistant
+> (`ai-voice-assistant`), but its defaults (`server_name`, `app_dir`, and project
+> labels) retain the original `james-voice-service` identifiers so existing
+> Terraform state and scheduled deployments are not disrupted. Override these
+> values deliberately for a new stack; do not rename live resources without a
+> migration plan.
+
+Terraform for the reference **voice-service** host on **Hetzner Cloud**, designed
 so the *application deployment* stays provider-neutral and a future VPS provider
 can be added without rewriting the voice service.
 

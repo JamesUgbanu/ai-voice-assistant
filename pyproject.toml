@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "james-voice-service"
+name = "ai-voice-assistant"
 version = "0.1.0"
-description = "Self-hosted realtime voice service: WebSocket audio, STT, VAD, streaming TTS, and pluggable conversational backends."
+description = "Self-hosted AI voice assistant: WebSocket audio, STT, VAD, streaming TTS, voice cloning, and pluggable conversational backends."
 requires-python = ">=3.11"
 # Floors only; no lockfile yet (see README "Limitations"). Install on the
 # deployment host and pin the resulting image/digest for reproducible releases.

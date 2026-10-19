@@ -41,6 +41,7 @@ DEFAULT_SOURCE="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 HOST=""
 USER="deploy"
 PORT="22"
+# Legacy default retained for existing deployments; pass --app-dir for new hosts.
 APP_DIR="/opt/james-voice-service"
 SOURCE="${DEFAULT_SOURCE}"
 SECRETS=""

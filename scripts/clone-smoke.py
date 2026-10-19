@@ -15,10 +15,10 @@ Usage:
 
   # Or inside the running container (scripts/ is NOT baked into the image; the
   # reference mount is read-only, so write the output to /tmp and copy it out):
-  docker cp scripts/clone-smoke.py james-voice:/tmp/clone-smoke.py
-  docker exec -w /srv/voice james-voice python3 /tmp/clone-smoke.py \
+  docker cp scripts/clone-smoke.py voice-service:/tmp/clone-smoke.py
+  docker exec -w /srv/voice voice-service python3 /tmp/clone-smoke.py \
       --out /tmp/clone-smoke.wav
-  docker cp james-voice:/tmp/clone-smoke.wav ./clone-smoke.wav
+  docker cp voice-service:/tmp/clone-smoke.wav ./clone-smoke.wav
   open ./clone-smoke.wav
 
 Outputs a WAV under voice-reference/output/ (Git-ignored) and prints the exact

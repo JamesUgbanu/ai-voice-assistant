@@ -4,8 +4,8 @@
 services:
   voice:
     build: .
-    image: james-voice-service:0.1.0
-    container_name: james-voice
+    image: voice-service:0.1.0
+    container_name: voice-service
     restart: unless-stopped
     # No `user:` override: the image already runs as the non-root `voice`
     # user, which owns /srv/voice. Overriding the uid here would break
@@ -52,7 +52,7 @@ services:
 
   caddy:
     image: caddy:2.9-alpine
-    container_name: james-voice-caddy
+    container_name: voice-service-caddy
     restart: unless-stopped
     ports:
       - "80:80"

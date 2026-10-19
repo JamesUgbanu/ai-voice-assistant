@@ -163,8 +163,9 @@ exists solely for offline unit tests).
 2. `docker compose stop voice` — in-flight WebSockets close; SQLite
    retains settled usage so no quota is lost or double-counted.
 3. To roll the voice service back one image: retag/redeploy the previous
-   image (`james-voice-service:<prev>` — tag releases; `latest` is never
-   used in production Compose files).
+   pinned image (`voice-service:<prev>` or its digest; existing deployments may
+   still use the legacy `james-voice-service` image name). `latest` is never
+   used in production Compose files.
 4. Portfolio RAG bearer change rolls back independently (it is additive
    and inert without the header); text clients never observe it.
 

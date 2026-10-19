@@ -194,7 +194,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="james-voice-service", version="0.1.0", docs_url=None, redoc_url=None, lifespan=lifespan)
+    app = FastAPI(title="AI Voice Assistant", version="0.1.0", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,

@@ -8,6 +8,10 @@
 #   terraform plan -var-file=terraform.tfvars
 #
 # Every value below is a placeholder or a documented default.
+#
+# Rename note: server_name, app_dir, and the project label retain the original
+# deployment identifiers so existing Terraform state is not disrupted. Override
+# them deliberately when creating a new stack.
 
 environment = "production"
 server_name = "james-voice-service"

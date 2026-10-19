@@ -4,7 +4,7 @@
 # opt-in convenience pointer and is NEVER used implicitly by production.
 #
 # Usage:
-#   GHCR_IMAGE=ghcr.io/<owner>/james-voice-service \
+#   GHCR_IMAGE=ghcr.io/<owner>/voice-service \
 #     scripts/release-image.sh <version> [--stable]
 #   e.g. scripts/release-image.sh 2026.10.17.1
 #
@@ -33,7 +33,7 @@ if [ "$VERSION" = "latest" ] || [ "$VERSION" = "stable" ]; then
 fi
 IMAGE="${GHCR_IMAGE:-}"
 if [ -z "$IMAGE" ]; then
-  echo "set GHCR_IMAGE=ghcr.io/<owner>/james-voice-service" >&2
+  echo "set GHCR_IMAGE=ghcr.io/<owner>/voice-service" >&2
   exit 2
 fi
 PLATFORM="${PLATFORM:-linux/amd64}"

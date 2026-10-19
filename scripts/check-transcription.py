@@ -10,9 +10,9 @@ without touching production configuration.
 Needs model packages (faster-whisper, torch, numpy); run where they are
 installed, e.g. inside the voice container (models are cached there):
 
-    docker cp BECAUSE.wav james-voice:/tmp/x.wav
-    docker exec james-voice python3 scripts/check-transcription.py /tmp/x.wav
-    docker exec james-voice python3 scripts/check-transcription.py /tmp/x.wav --model small.en
+    docker cp BECAUSE.wav voice-service:/tmp/x.wav
+    docker exec voice-service python3 scripts/check-transcription.py /tmp/x.wav
+    docker exec voice-service python3 scripts/check-transcription.py /tmp/x.wav --model small.en
 
 Prints: transcript, no_speech flag, avg logprob, per-segment details,
 audio stats, config, and wall-clock transcription time.

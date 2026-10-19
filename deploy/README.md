@@ -5,6 +5,14 @@
 > records, SSM paths, and secrets before adapting it. It is not required to
 > use the voice service.
 
+> **Rename compatibility note.** The project is now AI Voice Assistant
+> (`ai-voice-assistant`), and new releases use the internal `voice-service`
+> image name. This runbook is retained as historical production evidence:
+> identifiers created by the original deployment, including the
+> `james-voice-service` image and `james-voice` tunnel/cloud resources, are not
+> renamed retroactively. Update `VOICE_IMAGE` deliberately when migrating an
+> existing host.
+
 This is the authoritative runbook for the scheduled, disposable Hetzner
 deployment. The root `DEPLOY.md` describes an older long-lived-Compose setup and
 is **not** the production path.

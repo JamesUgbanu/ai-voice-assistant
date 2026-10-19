@@ -1,10 +1,51 @@
-# Realtime voice service
+# AI Voice Assistant
 
-A self-hosted voice layer for a web application: browser microphone audio over
-WebSocket, voice activity detection, speech recognition, a **pluggable
-conversational backend**, streamed text-to-speech, and barge-in. The reference
+**A self-hosted, real-time voice assistant for web applications.**
+
+One conversation. Text or voice.
+
+AI Voice Assistant is James's self-hosted voice layer for a web application. It
+adds browser microphone audio, speech recognition, retrieval-grounded
+conversation, streamed text-to-speech, and barge-in to an existing backend
+without replacing it.
+
+![Ask James assistant interface showing text and voice interaction in one conversation](assets/hero.jpg)
+
+**[Live demo](https://jamesugbanu.com)** · [Quick start](#quick-start) ·
+[Integration guide](INTEGRATION.md) · [MIT License](LICENSE)
+
+[Protocol](PROTOCOL.md) · [Configuration](#configuration) ·
+[Deployment](DEPLOY.md) · [Security](SECURITY.md)
+
+## What it solves
+
+Most web assistants are text-only. Adding voice means coordinating microphone
+capture, turn detection, speech recognition, a knowledge-grounded response, and
+streamed speech synthesis. This project packages that voice path as one
+self-hosted AI voice assistant service, so an existing RAG API or chat backend
+can support spoken conversations without becoming a voice product itself.
+
+Typical uses include adding voice to an existing RAG chatbot or documentation
+assistant, self-hosting speech-to-text and text-to-speech for a web app, and
+prototyping realtime voice agents with barge-in and streamed audio. The reference
 deployment powers `jamesugbanu.com`; the core is reusable with any application
 and any HTTP conversational backend.
+
+## Demo
+
+The [live portfolio](https://jamesugbanu.com) demonstrates the user experience:
+one Ask James conversation where text and voice share the same history and
+context. It is a portfolio deployment, not a standalone hosted demo of this voice
+service. This repository documents how to run, configure, and integrate the
+service.
+
+> **Project status:** This is a self-hosted reference implementation, not a
+> hosted API or managed product. The stdlib test suite covers protocol
+> validation, turn orchestration, authentication, quotas, and packaging/privacy
+> guards. Model-backed voice quality, Docker images, and the reference
+> infrastructure templates require validation in your environment. See
+> [Limitations](#limitations). No performance or production-readiness guarantee
+> is implied.
 
 - **Audio and turn lifecycle** belong to this service. It never stores your
   knowledge base and does not need your application's database.
@@ -58,6 +99,20 @@ browser speakers ◀── WS / PCM16 ────┘
 
 The full message reference is in [`PROTOCOL.md`](PROTOCOL.md). Backend
 contracts are in [`INTEGRATION.md`](INTEGRATION.md).
+
+## Technology stack
+
+| Layer | Implementation |
+|---|---|
+| API and transport | FastAPI, Uvicorn, WebSocket, PCM16 audio |
+| Speech recognition | faster-whisper on CPU, Silero VAD |
+| Speech synthesis | Pocket TTS: preset voice or authorized cloned voice |
+| Conversation | Portfolio RAG adapter (default) or a generic HTTP/SSE responder |
+| Session state | SQLite, HMAC session tickets, optional scoped widget tokens |
+| Packaging | Docker, Docker Compose, optional Terraform reference infrastructure |
+
+The stack is self-hosted and CPU-first: no hosted voice API, external database,
+or GPU is required for the reference path.
 
 ## Requirements
 

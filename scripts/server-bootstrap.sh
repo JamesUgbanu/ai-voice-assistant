@@ -7,7 +7,7 @@
 # passed through cloud-init user-data, and never printed.
 #
 # Run on the server as root:
-#   VOICE_IMAGE=ghcr.io/<owner>/james-voice-service:<version-or-digest> \
+#   VOICE_IMAGE=ghcr.io/<owner>/voice-service:<version-or-digest> \
 #   GHCR_USER=<github-user> \
 #   GHCR_TOKEN_FILE=/run/voice/ghcr-token \
 #   VOICE_ENV_FILE=/etc/voice/voice.env \
@@ -22,6 +22,7 @@ GHCR_USER="${GHCR_USER:?set GHCR_USER}"
 GHCR_TOKEN_FILE="${GHCR_TOKEN_FILE:?set GHCR_TOKEN_FILE (root-only, read token)}"
 ENV_FILE="${VOICE_ENV_FILE:?set VOICE_ENV_FILE (root-only runtime env)}"
 HEALTH_URL="${VOICE_HEALTH_URL:-http://127.0.0.1:8000/healthz}"
+# Retained for existing deployments. New installs can set VOICE_CONTAINER=voice-service.
 NAME="${VOICE_CONTAINER:-james-voice}"
 
 # 1. Docker (installed only if missing; re-run is a no-op)

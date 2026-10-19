@@ -15,9 +15,9 @@ Usage:
   python3 scripts/bench-streaming-stt.py /path/to/x.wav --speed 4   # 4x replay
 
   # Or inside the running container (scripts/ is NOT baked into the image):
-  docker cp scripts/bench-streaming-stt.py james-voice:/tmp/bench-stt.py
-  docker cp /path/to/x.wav james-voice:/tmp/x.wav
-  docker exec -w /srv/voice james-voice python3 /tmp/bench-stt.py /tmp/x.wav --model base.en
+  docker cp scripts/bench-streaming-stt.py voice-service:/tmp/bench-stt.py
+  docker cp /path/to/x.wav voice-service:/tmp/x.wav
+  docker exec -w /srv/voice voice-service python3 /tmp/bench-stt.py /tmp/x.wav --model base.en
 
 Reports (all vs the audio-arrival clock, so it answers "how soon does text
 appear while the user is still speaking?"):
