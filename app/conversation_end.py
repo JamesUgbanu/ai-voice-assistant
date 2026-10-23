@@ -27,9 +27,12 @@ _DONE_RE = re.compile(
     r"that'?s (all|everything|it)|that will be all|"
     r"no more questions|no further questions|i have no (more|further) questions|"
     r"nothing else|no thanks|no thank you|"
-    r"i'?m (all )?(done|good|set|finished)|we'?re (all )?(good|done|set|finished)|"
+    r"i'?m (all )?(done|set|finished)|"
+    r"i'?m (all )?good(?:[.!?]*\s*$| now\b)|"
+    r"we'?re (all )?(done|set|finished)|"
+    r"we'?re (all )?good(?:[.!?]*\s*$| now\b)|"
     r"i'?m good now|all good now"
-    r")\b",
+    r")(?![a-z0-9])",
     re.IGNORECASE,
 )
 

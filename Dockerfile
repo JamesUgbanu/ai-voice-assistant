@@ -9,6 +9,8 @@ FROM python:3.12-slim-bookworm AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=10 \
     OMP_NUM_THREADS=2 \
     MKL_NUM_THREADS=2 \
     MALLOC_ARENA_MAX=2
@@ -28,10 +30,14 @@ COPY pyproject.toml ./
 COPY app/__init__.py ./app/__init__.py
 # CPU-only torch: the default PyPI index serves multi-GB CUDA wheels that
 # this CPU service never uses. Install CPU torch explicitly first.
-RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch && \
-    pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir --timeout 120 --retries 10 \
+        --index-url https://download.pytorch.org/whl/cpu torch==2.5.1 && \
+    pip install --no-cache-dir --timeout 120 --retries 10 -e .
 
 COPY app ./app
+# The manifest is runtime data, not a Python package: verify the exact
+# checkpoint/tokenizer the pinned config selects at model load.
+COPY deploy/model-manifest.json ./deploy/model-manifest.json
 
 # Optional voice-cloning reference. The original deployment stages an
 # authorized recording at deploy/reference/voice-ref.wav (Git-ignored) and
@@ -53,6 +59,7 @@ RUN getent group voice >/dev/null || groupadd -r voice; \
 USER voice
 
 ENV VOICE_DB_PATH=/srv/voice/data/voice.sqlite3 \
+    VOICE_MODEL_MANIFEST=/srv/voice/deploy/model-manifest.json \
     HF_HOME=/srv/voice/models \
     XDG_CACHE_HOME=/srv/voice/models
 

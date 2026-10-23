@@ -152,8 +152,27 @@ class Settings:
         self.booking_api_url: str = get("VOICE_BOOKING_API_URL") or (
             _rag[: -len("/api/rag")] + "/api/booking" if _rag.endswith("/api/rag") else ""
         )
+        # Availability is read directly instead of waiting for an optional SSE
+        # booking event. This is what makes indirect requests ("anything
+        # Friday?") reliable; it reuses the portfolio's existing calendar.
+        _booking = self.booking_api_url.rstrip("/")
+        self.booking_availability_url: str = get("VOICE_BOOKING_AVAILABILITY_URL") or (
+            _booking + "/availability" if _booking.endswith("/booking") else ""
+        )
+        # Booking-only is the reference deployment's mode. Generic HTTP
+        # responders keep their own conversational behavior.
+        self.booking_only: bool = get("VOICE_BOOKING_ONLY", "1").strip().lower() in (
+            "1", "true", "yes"
+        )
         self.booking_timezone: str = get("VOICE_BOOKING_TIMEZONE", "Africa/Lagos")
-        self.booking_timeout_seconds: int = _getint(src, "VOICE_BOOKING_TIMEOUT_SECONDS", 20, 5, 60)        # Automatic call termination when the conversation has clearly ended.
+        self.booking_duration_minutes: int = _getint(
+            src, "VOICE_BOOKING_DURATION_MINUTES", 30, 5, 240
+        )
+        self.booking_timeout_seconds: int = _getint(
+            src, "VOICE_BOOKING_TIMEOUT_SECONDS", 20, 5, 60
+        )
+
+        # Automatic call termination when the conversation has clearly ended.
         # Only explicit, high-confidence closings ("goodbye", "that's all", …)
         # qualify; ambiguous/empty/ordinary turns never terminate.
         self.end_call_confidence: float = _getfloat(src, "VOICE_END_CALL_CONFIDENCE", 0.8, 0.5, 1.0)
@@ -193,6 +212,25 @@ class Settings:
                 "VOICE_RESPONDER=portfolio requires VOICE_RAG_API_URL and "
                 "VOICE_RAG_SERVICE_TOKEN (or set VOICE_RESPONDER=http and "
                 "VOICE_RESPONDER_URL)"
+            )
+        elif (
+            self.responder == "portfolio"
+            and self.booking_only
+            and not self.booking_availability_url
+        ):
+            errors.append(
+                "VOICE_BOOKING_ONLY=1 requires a derivable booking availability URL "
+                "(VOICE_RAG_API_URL ending in /api/rag, or "
+                "VOICE_BOOKING_AVAILABILITY_URL)"
+            )
+        elif (
+            self.responder == "portfolio"
+            and self.booking_only
+            and not self.booking_api_url
+        ):
+            errors.append(
+                "VOICE_BOOKING_ONLY=1 requires a booking API URL "
+                "(VOICE_BOOKING_API_URL, or VOICE_RAG_API_URL ending in /api/rag)"
             )
         elif self.responder == "http" and not self.responder_url:
             errors.append("VOICE_RESPONDER=http requires VOICE_RESPONDER_URL")

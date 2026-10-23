@@ -3,6 +3,7 @@
 These do not run Docker or Hetzner; they pin the safety-critical properties of
 the release/bootstrap files so a future edit cannot silently break them.
 """
+import json
 import os
 import re
 import unittest
@@ -117,6 +118,26 @@ class ReferenceBakeTest(unittest.TestCase):
         # Never cat/encode the reference contents in the release log.
         self.assertNotRegex(src, r"cat\s+\"?\$REF")
         self.assertNotRegex(src, r"base64.*\$REF")
+
+
+class ModelManifestReleaseTest(unittest.TestCase):
+    def test_dockerfile_ships_and_points_at_the_manifest(self):
+        src = read("Dockerfile")
+        self.assertIn("COPY deploy/model-manifest.json ./deploy/model-manifest.json", src)
+        self.assertIn(
+            "VOICE_MODEL_MANIFEST=/srv/voice/deploy/model-manifest.json", src
+        )
+
+    def test_manifest_is_valid_json_with_pinned_assets(self):
+        with open(os.path.join(ROOT, "deploy", "model-manifest.json"),
+                  encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        self.assertEqual(manifest["pocket_tts_version"], "4.0.0")
+        for key in ("gated_model", "non_gated_model", "tokenizer"):
+            asset = manifest[key]
+            self.assertRegex(asset["sha256"], r"^[0-9a-f]{64}$")
+            self.assertGreater(asset["size_bytes"], 0)
+            self.assertTrue(asset["revision"])
 
 
 class CostEstimatorTest(unittest.TestCase):

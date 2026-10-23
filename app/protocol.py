@@ -19,7 +19,8 @@ Rules:
   audio per turn capped (max_turn_audio_seconds).
 
 Client → server: hello, text_message, audio_frame, end_utterance,
-                 interrupt, ping, end_session
+                 interrupt, ping, end_session, playback_complete,
+                 playback_metrics
 Server → client: session_created, listening, transcript_partial,
                  transcript_final, assistant_text, rag_started, audio_frame,
                  turn_end, quota, error, pong, session_ended
@@ -45,6 +46,8 @@ CLIENT_EVENTS = frozenset({
     # Client confirms its playback queue drained (used to gate auto-end so the
     # closing goodbye is heard, not cut off).
     "playback_complete",
+    # Optional numeric playback health from the browser. No audio/text/PII.
+    "playback_metrics",
 })
 
 SERVER_EVENTS = frozenset({
@@ -70,6 +73,20 @@ SERVER_CAPABILITIES = frozenset({
     "playback_complete",  # client can confirm playback drained (auto-end gate)
     "text_message",       # client can send a typed turn on this voice session
     "assistant_text",     # server can expose the final answer text for transcript
+    "playback_metrics",   # client can report underruns/jitter/dropped frames
+})
+
+#: Numeric-only client playback metrics. Bounded so a hostile client cannot
+#: turn the log/metrics channel into unbounded data.
+PLAYBACK_METRIC_KEYS = frozenset({
+    "sample_rate",
+    "buffer_ms",
+    "queue_max_ms",
+    "render_lag_max_ms",
+    "underruns",
+    "dropped_frames",
+    "decode_errors",
+    "reconnect_count",
 })
 
 
@@ -103,7 +120,7 @@ class ProtocolError(ValueError):
         self.message = message
 
 
-def _require(condition: bool, code: str, message: string) -> None:
+def _require(condition: bool, code: str, message: str) -> None:
     if not condition:
         raise ProtocolError(code, message)
 
@@ -155,7 +172,19 @@ def make_envelope(event_type: str, payload: dict | None = None, *, seq: int = 0,
     return {"v": PROTOCOL_VERSION, "type": event_type, "seq": seq, "turn_id": turn_id, "payload": payload or {}}
 
 
-def is_fatal_error(code: string) -> bool:
+def validate_playback_metrics(payload: object) -> dict[str, int]:
+    """Return only known, non-negative integer metrics; never free text."""
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, int] = {}
+    for key in PLAYBACK_METRIC_KEYS:
+        value = payload.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 10_000_000:
+            out[key] = value
+    return out
+
+
+def is_fatal_error(code: str) -> bool:
     return code in FATAL_ERRORS
 
 

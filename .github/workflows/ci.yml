@@ -1,93 +1,232 @@
-name: tests
+name: CI
 
 on:
-  push:
   pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  RUFF_VERSION: "0.17.2"
+  TORCH_VERSION: "2.5.1"
+
 jobs:
   test:
+    name: Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            .github/workflows/ci.yml
       - name: Compile
         run: python -m py_compile app/*.py tests/*.py examples/*.py
-      - name: Packaging (editable install, no heavy model deps)
+      - name: Install project and test dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install --no-deps -e .
-      - name: Unit tests (stdlib only)
+          python -m pip install --timeout 120 --retries 10 \
+            --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}"
+          python -m pip install --timeout 120 --retries 10 -e . "ruff==${RUFF_VERSION}"
+      - name: Lint (critical errors)
+        run: ruff check --select E9,F63,F7,F82 app tests examples
+      - name: Test
         run: python -m unittest discover -s tests -v
 
-  publish:
+  image:
+    name: Linux image
     needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Ensure private files are absent
+        run: |
+          test ! -e .env
+          test ! -e deploy/reference/voice-ref.wav
+          if find . -path ./.git -prune -o -type f -name '.env*' \
+              ! -name '.env.example' -print -quit | grep -q .; then
+            echo "Unexpected environment file in the build context" >&2
+            exit 1
+          fi
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build linux/amd64 image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: voice-ci:${{ github.sha }}
+          provenance: false
+          cache-from: type=gha,scope=voice-image
+          cache-to: type=gha,mode=max,scope=voice-image
+      - name: Verify image contents and startup
+        env:
+          IMAGE: voice-ci:${{ github.sha }}
+          SMOKE_NAME: voice-ci-smoke-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}')" = "linux/amd64"
+          docker run --rm --entrypoint sh "$IMAGE" -c '
+            set -eu
+            test "$(id -u)" -ne 0
+            test ! -e /srv/voice/.env
+            test ! -e /srv/voice/.git
+            test ! -e /srv/voice/.github
+            test ! -e /srv/voice/tests
+            test ! -e /srv/voice/deploy/reference/voice-ref.wav
+            test ! -e /srv/voice/voice-reference/processed/voice-ref.wav
+            test -f /srv/voice/deploy/model-manifest.json
+          '
+          docker run --rm --entrypoint python "$IMAGE" -c \
+            'from importlib.metadata import version; from app.model_manifest import default_manifest_path, load_manifest; m = load_manifest(default_manifest_path()); assert version("pocket-tts") == m["pocket_tts_version"]; print("manifest: ok")'
+          docker run -d --name "$SMOKE_NAME" \
+            -e VOICE_USE_STUBS=1 \
+            -e "VOICE_HMAC_SECRET=$(openssl rand -hex 32)" \
+            -e VOICE_RESPONDER=http \
+            -e VOICE_RESPONDER_URL=http://127.0.0.1:9/ \
+            -p 18000:8000 "$IMAGE"
+          trap 'docker rm -f "$SMOKE_NAME" >/dev/null 2>&1 || true' EXIT
+          ready=false
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18000/healthz >/tmp/voice-health.json; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          cat /tmp/voice-health.json
+          grep -q '"status":"ok"' /tmp/voice-health.json
+          grep -q '"db":true' /tmp/voice-health.json
+
+  publish:
+    name: Publish GHCR
+    needs: [test, image]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-      - name: Ensure private audio and secrets are absent
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Ensure private files are absent
         run: |
-          test ! -e deploy/reference/voice-ref.wav
           test ! -e .env
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+          test ! -e deploy/reference/voice-ref.wav
+          if find . -path ./.git -prune -o -type f -name '.env*' \
+              ! -name '.env.example' -print -quit | grep -q .; then
+            echo "Unexpected environment file in the build context" >&2
+            exit 1
+          fi
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - id: meta
-        uses: docker/metadata-action@v5
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ghcr.io/jamesugbanu/ai-voice-assistant
           tags: |
             type=raw,value=${{ github.sha }}
-            type=raw,value=latest,enable={{is_default_branch}}
-      - id: build
-        uses: docker/build-push-action@v6
+            type=raw,value=main
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Build and push linux/amd64 image
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Verify pushed image
+          cache-from: type=gha,scope=voice-image
+          cache-to: type=gha,mode=max,scope=voice-image
+      - name: Verify published image
         env:
+          IMAGE: ghcr.io/jamesugbanu/ai-voice-assistant
           DIGEST: ${{ steps.build.outputs.digest }}
+          SMOKE_NAME: voice-publish-smoke-${{ github.run_id }}
         run: |
           set -euo pipefail
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          docker pull "$image@$DIGEST"
-          docker run --rm --entrypoint sh "$image@$DIGEST" -c \
-            'test ! -e /srv/voice/voice-reference/processed/voice-ref.wav'
-          docker run -d --name voice-publish-smoke \
+          test -n "$DIGEST"
+          docker pull "$IMAGE@$DIGEST"
+          docker run --rm --entrypoint sh "$IMAGE@$DIGEST" -c '
+            set -eu
+            test "$(id -u)" -ne 0
+            test ! -e /srv/voice/.env
+            test ! -e /srv/voice/tests
+            test ! -e /srv/voice/deploy/reference/voice-ref.wav
+            test ! -e /srv/voice/voice-reference/processed/voice-ref.wav
+            test -f /srv/voice/deploy/model-manifest.json
+          '
+          docker run -d --name "$SMOKE_NAME" \
             -e VOICE_USE_STUBS=1 \
             -e "VOICE_HMAC_SECRET=$(openssl rand -hex 32)" \
             -e VOICE_RESPONDER=http \
             -e VOICE_RESPONDER_URL=http://127.0.0.1:9/ \
-            -p 18000:8000 "$image@$DIGEST"
-          trap 'docker rm -f voice-publish-smoke >/dev/null 2>&1 || true' EXIT
+            -p 18000:8000 "$IMAGE@$DIGEST"
+          trap 'docker rm -f "$SMOKE_NAME" >/dev/null 2>&1 || true' EXIT
+          ready=false
           for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:18000/healthz >/tmp/health.json; then
+            if curl -fsS http://127.0.0.1:18000/healthz >/tmp/voice-health.json; then
+              ready=true
               break
             fi
             sleep 1
           done
-          cat /tmp/health.json
-          grep -q '"status":"ok"' /tmp/health.json
-          grep -q '"db":true' /tmp/health.json
-          echo "image: $image@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          test "$ready" = true
+          cat /tmp/voice-health.json
+          grep -q '"status":"ok"' /tmp/voice-health.json
+          grep -q '"db":true' /tmp/voice-health.json
+          echo "image: $IMAGE@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
           echo "tags: ${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check anonymous package access
+        env:
+          IMAGE: ghcr.io/jamesugbanu/ai-voice-assistant
+          TAG: ${{ github.sha }}
+        run: |
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          if docker manifest inspect "$IMAGE:$TAG" >/dev/null 2>&1; then
+            echo "Anonymous pull: available (package is public)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Anonymous pull: unavailable (package is private or anonymous access is disabled)" >> "$GITHUB_STEP_SUMMARY"
+          fi

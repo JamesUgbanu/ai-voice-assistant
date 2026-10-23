@@ -56,12 +56,13 @@ then `listening`. Every message is a JSON envelope
 | `ping` | `{}` | keep-alive; server replies `pong` after re-validating session |
 | `end_session` | `{reason}` | orderly hangup |
 | `playback_complete` | `{}` | client confirms its playback queue drained (advertised via `capabilities`) |
+| `playback_metrics` | numeric fields below | optional browser audio health; unknown/non-numeric keys are ignored |
 
 ### Server → client
 
 | type | payload | notes |
 |---|---|---|
-| `session_created` | `{session_id, max_seconds, capabilities}` | ready; capabilities include `playback_complete`, `text_message`, `assistant_text` |
+| `session_created` | `{session_id, max_seconds, capabilities}` | ready; capabilities include `playback_complete`, `text_message`, `assistant_text`, `playback_metrics` |
 | `listening` | `{}` | capturing |
 | `transcript_partial` | `{text, seq, turn_id}` | internal hypothesis; clients must not render it as user-visible transcription |
 | `transcript_final` | `{text, turn_id}` | authoritative user turn sent to RAG |
@@ -81,11 +82,27 @@ then `listening`. Every message is a JSON envelope
   (`VOICE_MAX_TURN_AUDIO_SECONDS`). 16-bit alignment is enforced; odd byte
   counts are rejected.
 - Output: PCM16 mono at the TTS native rate (24 kHz for Pocket TTS), chunked
-  server-side, peak-normalized/clipped to avoid integer wrap, and played
-  through a queued AudioContext. Typed turns use the same output path.
+  server-side, DC-blocked with continuous gain and capped at the target peak
+  to avoid integer wrap or chunk-boundary clicks, then played through a queued
+  AudioContext. Typed turns use the same output path.
 - Ordering: frames carry connection `seq`; playback consumes FIFO per turn.
   Stale `turn_id` payloads are discarded.
 - WebSocket message cap: 262,144 bytes (`VOICE_MAX_MESSAGE_BYTES`).
+
+### Playback metrics (optional)
+
+Clients that advertise `playback_metrics` may send:
+
+```json
+{"v":1,"type":"playback_metrics","seq":12,"turn_id":"...","payload":{
+  "sample_rate":24000,"buffer_ms":180,"queue_max_ms":480,
+  "render_lag_max_ms":35,"underruns":0,"dropped_frames":0,
+  "decode_errors":0,"reconnect_count":0}}
+```
+
+Only the listed keys, integer values, and non-negative sizes are accepted.
+Free text, audio, and unknown keys are discarded. The server logs numeric
+metrics only; it never echoes them or uses them for scheduling.
 
 ### Cancellation
 

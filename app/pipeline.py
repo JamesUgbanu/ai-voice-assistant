@@ -13,18 +13,93 @@ TTS synthesizes sentence by sentence (abort between sentences).
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
+import weakref
+from concurrent.futures import TimeoutError as FutureTimeout
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from .turns import TurnState, split_sentences
-from .segmentation import SegmentationBuffer
-from .rag_client import RagError
 from .logging_util import event
-import logging
+from .rag_client import RagError
+from .segmentation import SegmentationBuffer
+from .turns import TurnState, split_sentences
 
 logger = logging.getLogger("voice")
+
+# How often a consumer/producer re-checks cancellation while waiting on the
+# bounded audio queue. Short enough for responsive barge-in, long enough to
+# avoid busy-looping while TTS is still generating the next chunk.
+_QUEUE_POLL_S = 0.05
+
+# A stopped producer normally exits immediately. If a backend ignores `stop`,
+# Python cannot safely kill its thread, so bound how long the turn waits before
+# declaring it stalled. The gate below then refuses new synthesis until that
+# producer actually exits, instead of spawning more stuck threads/turns.
+_PRODUCER_STOP_TIMEOUT_S = 2.0
+_PRODUCER_GATE_POLL_S = 0.1
+
+
+class TtsProducerUnavailable(RuntimeError):
+    """A previous TTS producer is still alive after cancellation."""
+
+
+class _ProducerGate:
+    """At most one pipeline-managed TTS producer per backend at a time.
+
+    This is both normal serialization (the model is single-instance) and
+    containment for a non-cooperative backend: a producer that outlives the
+    stop timeout keeps the gate closed, so repeated turns fail closed instead
+    of accumulating worker threads and model-lock waiters. The gate reopens
+    only when that producer's future completes.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.loop = loop
+        self._sem = asyncio.Semaphore(1)
+        self._stalled = False
+
+    async def acquire(self) -> None:
+        while True:
+            if self._stalled:
+                raise TtsProducerUnavailable("tts producer is still shutting down")
+            try:
+                await asyncio.wait_for(
+                    self._sem.acquire(), timeout=_PRODUCER_GATE_POLL_S
+                )
+            except TimeoutError:
+                # Keep polling so a stall declared by the active turn wakes
+                # waiters promptly; normal waits remain unbounded (a segment
+                # can legitimately take longer than the poll interval).
+                continue
+            if self._stalled:
+                self._sem.release()
+                raise TtsProducerUnavailable("tts producer is still shutting down")
+            return
+
+    def mark_stalled(self) -> None:
+        self._stalled = True
+
+    def release(self) -> None:
+        self._stalled = False
+        self._sem.release()
+
+
+# TTS backends are process singletons in production, but tests construct
+# several; keying by identity keeps their gates independent.
+_PRODUCER_GATES: weakref.WeakKeyDictionary[object, _ProducerGate] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _producer_gate(tts, loop: asyncio.AbstractEventLoop) -> _ProducerGate:
+    gate = _PRODUCER_GATES.get(tts)
+    if gate is None or gate.loop is not loop:
+        gate = _ProducerGate(loop)
+        _PRODUCER_GATES[tts] = gate
+    return gate
 
 
 @dataclass
@@ -35,7 +110,7 @@ class TurnResult:
     audio_frames: int
     cancelled: bool = False
     error: str | None = None
-    # True when a deterministic fast path (e.g. a greeting) answered without
+    # True when a deterministic fast path (e.g. social/greeting) answered without
     # a RAG round trip.
     fast_path: bool = False
 
@@ -70,6 +145,16 @@ class TurnTimings:
     # audible" proxy; the browser adds decode + scheduling on top).
     first_audio_ms: int = 0
     total_ms: int = 0
+    # Audio-path health. These separate synthesis stalls from transport stalls:
+    # queue_max is high-water backpressure, send_ms is time spent in the
+    # WebSocket emit callback, frame_gap_max is the longest between-frame gap
+    # (a server-side underrun-risk proxy), and producer_wait_ms is time the TTS
+    # thread spent blocked because the consumer could not keep up.
+    tts_queue_max: int = 0
+    tts_send_ms: int = 0
+    tts_max_frame_gap_ms: int = 0
+    tts_underrun_risk_frames: int = 0
+    tts_producer_wait_ms: int = 0
 
 
 def turn_end_reason(result: "TurnResult") -> str | None:
@@ -246,7 +331,7 @@ async def run_turn(
         if asyncio.iscoroutine(res):
             await res
 
-    # Deterministic fast path (e.g. a strict greeting): answer locally with a
+    # Deterministic fast path (e.g. strict social/greeting): answer locally with a
     # short reply instead of a remote RAG round trip. Strict and confidence
     # gated upstream; returns None for anything with extra content.
     fast_text: str | None = None
@@ -276,9 +361,11 @@ async def run_turn(
         # quiet upstream can never hold pending text — and first audio — hostage.
         poll_wait = min(seg.get("max_wait_ms", 1200), seg.get("first_max_wait_ms", 1200))
         poll_s = max(0.05, min(0.25, poll_wait / 4000.0))
+        last_emit_at: int | None = None
+        prev_frame_ms = 0
 
         async def speak(segment: str) -> None:
-            nonlocal frames, tts_started, t_first_synth
+            nonlocal frames, tts_started, t_first_synth, last_emit_at, prev_frame_ms
             if not alive():
                 return
             if state.state != "speaking":
@@ -303,23 +390,49 @@ async def run_turn(
             # synthesized. `stop` lets barge-in abort mid-generation. The queue
             # is bounded so a slow/stalled consumer applies backpressure to the
             # synthesizer instead of buffering audio without limit.
+            loop = asyncio.get_running_loop()
+            gate = _producer_gate(tts, loop)
+            try:
+                # Admission is asynchronous: a second session/segment waits
+                # here instead of creating another thread that blocks on the
+                # model lock. If a prior producer stalled, this fails closed.
+                await gate.acquire()
+            except TtsProducerUnavailable:
+                event(logger, "tts_producer_unavailable", turn=turn_id)
+                raise
+            if not alive():
+                gate.release()
+                return
             stop = threading.Event()
             queue: "asyncio.Queue" = asyncio.Queue(maxsize=64)
             sentinel = object()
-            loop = asyncio.get_running_loop()
+            sample_rate = max(1, int(getattr(tts, "sample_rate", 24000)))
 
-            def put_blocking(item) -> None:
+            def put_blocking(item) -> bool:
+                """Queue one item without letting a full queue outlive a
+                cancelled turn. Returns False when stopped/consumer is gone."""
                 try:
-                    asyncio.run_coroutine_threadsafe(queue.put(item), loop).result()
-                except Exception:
-                    pass  # loop closing / consumer gone
+                    fut = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+                except Exception:  # noqa: BLE001 - loop closing/consumer gone
+                    return False
+                while True:
+                    try:
+                        fut.result(timeout=_QUEUE_POLL_S)
+                        return True
+                    except FutureTimeout:
+                        if stop.is_set() or loop.is_closed():
+                            fut.cancel()
+                            return False
+                    except Exception:  # noqa: BLE001 - failed queue put
+                        return False
 
             _prod = {"synth_ms": 0, "put_ms": 0}
 
             def produce() -> None:
+                it = None
                 try:
                     it = tts.synthesize_stream(segment, tts_config, stop=stop)
-                    while True:
+                    while not stop.is_set():
                         _s = clock()
                         try:
                             chunk = next(it)
@@ -329,17 +442,63 @@ async def run_turn(
                         if stop.is_set():
                             break
                         _p = clock()
-                        put_blocking(chunk)
+                        queued = put_blocking(chunk)
                         _prod["put_ms"] += clock() - _p
+                        if not queued:
+                            break
                 except BaseException as exc:  # surfaced to the consumer
                     put_blocking(exc)
                 finally:
-                    put_blocking(sentinel)
+                    if it is not None:
+                        close = getattr(it, "close", None)
+                        if callable(close):
+                            # Release model/lock resources on abort; close()
+                            # is best-effort and must not mask cancellation.
+                            with suppress(Exception):
+                                close()
+                    if not stop.is_set():
+                        put_blocking(sentinel)
 
-            producer = loop.run_in_executor(None, produce)
+            producer = None
+            gate_released = False
+
+            def release_gate() -> None:
+                nonlocal gate_released
+                if gate_released:
+                    return
+                gate_released = True
+                report_recovered = getattr(tts, "report_producer_recovered", None)
+                if callable(report_recovered):
+                    report_recovered()
+                gate.release()
+
+            seg_audio_ms = 0
+            seg_queue_max = 0
+            seg_max_gap = 0
+            seg_underruns = 0
+            seg_send_ms = 0
             try:
+                producer = loop.run_in_executor(None, produce)
+                # If the producer outlives this turn, its completion (not the
+                # turn) reopens the gate. The callback is idempotent with the
+                # normal-path release below.
+                def _release_when_done(_f) -> None:
+                    with suppress(RuntimeError):
+                        loop.call_soon_threadsafe(release_gate)
+
+                producer.add_done_callback(_release_when_done)
                 while True:
-                    item = await queue.get()
+                    # Do not sleep on an unbounded queue.get(): an interrupt
+                    # must stop the producer even when no further chunk arrives.
+                    if not alive():
+                        stop.set()
+                        break
+                    try:
+                        item = await asyncio.wait_for(
+                            queue.get(), timeout=_QUEUE_POLL_S
+                        )
+                    except TimeoutError:
+                        continue
                     if item is sentinel:
                         break
                     if isinstance(item, BaseException):
@@ -353,21 +512,82 @@ async def run_turn(
                         tts_started = True
                     if timings.first_audio_ms == 0:
                         timings.first_audio_ms = clock() - t0
+                    # Include the frame just dequeued: qsize() excludes it.
+                    qsize = queue.qsize() + 1
+                    seg_queue_max = max(seg_queue_max, qsize)
+                    frame_ms = max(1, round((len(item) / 2) / sample_rate * 1000))
+                    now = clock()
+                    if last_emit_at is not None:
+                        gap = max(0, now - last_emit_at)
+                        seg_max_gap = max(seg_max_gap, gap)
+                        if gap > prev_frame_ms + 60:
+                            seg_underruns += 1
                     frames += 1
                     _seg_frames += 1
+                    seg_audio_ms += frame_ms
+                    send_started = clock()
                     res = emit_audio_frame(item, False)
                     if asyncio.iscoroutine(res):
                         await res
+                    seg_send_ms += max(0, clock() - send_started)
+                    last_emit_at = clock()
+                    prev_frame_ms = frame_ms
             finally:
                 stop.set()
                 # Drain so a producer blocked on a full queue can observe
-                # `stop` and exit; then release its thread.
+                # `stop` and exit; then release its thread. Never wait forever
+                # on a backend that ignores `stop`: a stuck synthesis thread
+                # must not hold the turn/socket open indefinitely.
                 try:
                     while True:
                         queue.get_nowait()
                 except asyncio.QueueEmpty:
                     pass
-                await producer
+                if producer is None:
+                    release_gate()
+                else:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(producer),
+                            timeout=_PRODUCER_STOP_TIMEOUT_S,
+                        )
+                    except TimeoutError:
+                        # No safe in-process kill exists for a non-cooperative
+                        # backend. Keep the gate closed until the future ends;
+                        # meanwhile new TTS work fails closed as `tts_failed`.
+                        gate.mark_stalled()
+                        report_stalled = getattr(
+                            tts, "report_producer_stalled", None
+                        )
+                        if callable(report_stalled):
+                            report_stalled()
+                        event(
+                            logger,
+                            "tts_producer_stalled",
+                            turn=turn_id,
+                            stop_set=stop.is_set(),
+                        )
+                    except asyncio.CancelledError:
+                        # A socket/turn cancel can arrive while waiting for a
+                        # producer that ignores stop. Treat it like a timeout,
+                        # but still propagate the cancellation.
+                        if not producer.done():
+                            gate.mark_stalled()
+                            report_stalled = getattr(
+                                tts, "report_producer_stalled", None
+                            )
+                            if callable(report_stalled):
+                                report_stalled()
+                        raise
+                    else:
+                        release_gate()
+                timings.tts_queue_max = max(timings.tts_queue_max, seg_queue_max)
+                timings.tts_send_ms += seg_send_ms
+                timings.tts_max_frame_gap_ms = max(
+                    timings.tts_max_frame_gap_ms, seg_max_gap
+                )
+                timings.tts_underrun_risk_frames += seg_underruns
+                timings.tts_producer_wait_ms += int(_prod.get("put_ms", 0))
                 if _diag:
                     event(
                         logger,
@@ -375,10 +595,14 @@ async def run_turn(
                         turn=turn_id,
                         chars=len(segment),
                         frames=_seg_frames,
-                        audio_ms=_seg_frames * 80,
+                        audio_ms=seg_audio_ms,
                         span_ms=clock() - _seg_t0,
                         synth_ms=_prod["synth_ms"],
                         put_ms=_prod["put_ms"],
+                        queue_max=seg_queue_max,
+                        frame_gap_max_ms=seg_max_gap,
+                        underrun_risk_frames=seg_underruns,
+                        send_ms=seg_send_ms,
                     )
 
         ait = (_static_stream(fast_text) if fast_text else rag_stream(transcript)).__aiter__()

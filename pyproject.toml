@@ -7,21 +7,22 @@ name = "ai-voice-assistant"
 version = "0.1.0"
 description = "Self-hosted AI voice assistant: WebSocket audio, STT, VAD, streaming TTS, voice cloning, and pluggable conversational backends."
 requires-python = ">=3.11"
-# Floors only; no lockfile yet (see README "Limitations"). Install on the
-# deployment host and pin the resulting image/digest for reproducible releases.
+# Pocket TTS is pinned because its model/config/API revision is part of the
+# runtime contract. Other packages remain bounded ranges; pin the resulting
+# image/digest for reproducible releases.
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
     "pydantic>=2.10",
     "faster-whisper>=1.0",
-    "pocket-tts>=0.2",
+    "pocket-tts==4.0.0",
     # NOTE: install torch from the CPU index on Linux to avoid multi-GB
     # CUDA wheels: pip install torch --index-url https://download.pytorch.org/whl/cpu
-    "torch>=2.5",
+    "torch>=2.5,<2.6",
     # NOTE: Silero VAD has no PyPI distribution used here — it loads via
     # torch.hub (pinned by VOICE_VAD_SOURCE, vendorable with local:).
     # Do not `pip install silero-vad`; it is not this dependency.
-    "numpy>=1.26",
+    "numpy>=2,<3",
     "scipy>=1.14",
     "httpx>=0.28",
 ]

@@ -166,6 +166,21 @@ class BookingConversationTest(unittest.TestCase):
         # key must survive so a retry reconciles instead of double-booking.
         s.mark_uncertain()
         self.assertEqual(s.stage, "confirm")
+
+        # A different day must not discard the only key that can reconcile the
+        # unknown submission, which could otherwise lead to a second booking.
+        blocked, blocked_payload = s.handle("What about Friday?", TZ)
+        self.assertIn("verify the earlier request", blocked or "")
+        self.assertIsNone(blocked_payload)
+        self.assertEqual(s.idempotency, payload["idempotencyKey"])
+        blocked, _ = s.handle("What projects has James built?", TZ)
+        self.assertIn("verify the earlier request", blocked or "")
+        self.assertEqual(s.idempotency, payload["idempotencyKey"])
+        blocked, _ = s.handle("no thanks", TZ)
+        self.assertIn("verify the earlier request", blocked or "")
+        self.assertEqual(s.stage, "confirm")
+        self.assertEqual(s.idempotency, payload["idempotencyKey"])
+
         retry_reply, retry_payload = s.handle("yes", TZ)
         self.assertIsNone(retry_reply)
         self.assertEqual(retry_payload["idempotencyKey"], payload["idempotencyKey"])

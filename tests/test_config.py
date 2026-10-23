@@ -143,3 +143,66 @@ class ConfigTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BookingConfigTest(unittest.TestCase):
+    BASE = {
+        "VOICE_HMAC_SECRET": "x" * 32,
+        "VOICE_RAG_API_URL": "https://example.test/api/rag",
+        "VOICE_RAG_SERVICE_TOKEN": "token",
+    }
+
+    def test_booking_only_defaults_and_derived_availability(self):
+        s = Settings(env=self.BASE)
+        self.assertTrue(s.booking_only)
+        self.assertEqual(s.booking_api_url, "https://example.test/api/booking")
+        self.assertEqual(
+            s.booking_availability_url,
+            "https://example.test/api/booking/availability",
+        )
+        self.assertEqual(s.booking_timezone, "Africa/Lagos")
+        self.assertEqual(s.booking_duration_minutes, 30)
+        self.assertEqual(s.validation_errors(), [])
+
+    def test_booking_only_can_be_disabled_but_availability_override_wins(self):
+        s = Settings(env={**self.BASE, "VOICE_BOOKING_ONLY": "0"})
+        self.assertFalse(s.booking_only)
+        self.assertEqual(
+            Settings(env={
+                **self.BASE,
+                "VOICE_BOOKING_AVAILABILITY_URL": "https://calendar.test/open",
+                "VOICE_BOOKING_DURATION_MINUTES": "999",
+            }).booking_availability_url,
+            "https://calendar.test/open",
+        )
+        self.assertEqual(
+            Settings(env={
+                **self.BASE,
+                "VOICE_BOOKING_DURATION_MINUTES": "999",
+            }).booking_duration_minutes,
+            240,
+        )
+
+    def test_booking_only_fails_closed_without_a_derivable_calendar(self):
+        s = Settings(env={
+            "VOICE_HMAC_SECRET": "x" * 32,
+            "VOICE_RAG_API_URL": "https://example.test/chat",
+            "VOICE_RAG_SERVICE_TOKEN": "token",
+        })
+        self.assertEqual(s.booking_availability_url, "")
+        self.assertTrue(any("booking availability URL" in e for e in s.validation_errors()))
+        off = Settings(env={
+            "VOICE_HMAC_SECRET": "x" * 32,
+            "VOICE_RAG_API_URL": "https://example.test/chat",
+            "VOICE_RAG_SERVICE_TOKEN": "token",
+            "VOICE_BOOKING_ONLY": "0",
+        })
+        self.assertEqual(off.validation_errors(), [])
+
+        no_api = Settings(env={
+            "VOICE_HMAC_SECRET": "x" * 32,
+            "VOICE_RAG_API_URL": "https://example.test/chat",
+            "VOICE_RAG_SERVICE_TOKEN": "token",
+            "VOICE_BOOKING_AVAILABILITY_URL": "https://calendar.test/open",
+        })
+        self.assertTrue(any("booking API URL" in e for e in no_api.validation_errors()))

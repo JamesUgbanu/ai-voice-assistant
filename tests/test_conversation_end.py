@@ -60,6 +60,19 @@ class ClassifyCompletionTest(unittest.TestCase):
     def test_case_and_punctuation_insensitive(self):
         self.assertTrue(classify_completion("GOODBYE!!!").should_end_call)
 
+    def test_polite_feeling_is_not_a_completion_signal(self):
+        for text in [
+            "I'm good, thanks",
+            "I'm good thanks",
+            "Doing well, thank you",
+            "We're good, thanks",
+        ]:
+            self.assertFalse(classify_completion(text).should_end_call, text)
+
+    def test_explicit_good_now_still_completes(self):
+        for text in ["I'm good now", "I'm good.", "We're good now"]:
+            self.assertTrue(classify_completion(text).should_end_call, text)
+
     def test_word_boundaries_no_substring_false_positive(self):
         # "goodbyes"/"byes" inside other words must not fire.
         self.assertFalse(classify_completion("the goodbyes were hard").should_end_call)

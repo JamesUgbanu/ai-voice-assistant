@@ -1,0 +1,25 @@
+{
+  "pocket_tts_version": "4.0.0",
+  "config": "pocket_tts/config/english.yaml",
+  "gated_model": {
+    "repo": "kyutai/pocket-tts",
+    "revision": "7f364c05d1be3faf2b234cdbe4cbb68a026d4218",
+    "path": "languages/english/model.safetensors",
+    "sha256": "7767ce79b1b8db523d867e70855a00627aacfe44aaa5c1fd7ebe135fba71fff9",
+    "size_bytes": 219029196
+  },
+  "non_gated_model": {
+    "repo": "kyutai/pocket-tts-without-voice-cloning",
+    "revision": "575d14372df89a4534bcb989870a34e77544b09f",
+    "path": "languages/english/model.safetensors",
+    "sha256": "e106c451108e066119f070eb7cf6c9ff4a2ad93f3bf04c9914cc94c66b7a4eeb",
+    "size_bytes": 219029196
+  },
+  "tokenizer": {
+    "repo": "kyutai/pocket-tts-without-voice-cloning",
+    "revision": "00eac05ed3d16bdc3f6b5d598874019c34a89214",
+    "path": "languages/english/tokenizer.json",
+    "sha256": "f498428e1eafee50492f7be13dc9bfafcfc12e508cd0eb1b01c92ecd5d8c6687",
+    "size_bytes": 245020
+  }
+}

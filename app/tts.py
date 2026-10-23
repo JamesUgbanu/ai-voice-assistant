@@ -14,12 +14,18 @@ import os
 import threading
 from dataclasses import dataclass
 
+from .model_manifest import ModelIntegrityError
+
 logger = logging.getLogger("voice")
 
 
 class VoiceCloningUnavailable(RuntimeError):
     """Clone mode was requested but cannot run. Message is user-actionable and
     contains no secrets or private paths."""
+
+
+class TtsBusy(RuntimeError):
+    """A prior stream has not released the model after cancellation."""
 
 
 @dataclass
@@ -92,20 +98,54 @@ def _pcm16(audio) -> bytes:
 class Pcm16StreamEncoder:
     """Stateful float-audio → PCM16 encoder for chunked synthesis.
 
-    Independent per-chunk peak normalization makes gain jump at every chunk
-    boundary (audible pumping). This encoder removes DC per chunk, but keeps
-    gain continuous: loud passages reduce gain immediately to prevent clipping,
-    while quieter passages recover gradually. Samples are clipped before
-    conversion, so model overshoot cannot wrap.
+    Two chunk-boundary defects caused audible clicks/pumping:
+    subtracting each chunk's own mean reset the DC level to zero at every
+    boundary, and switching gain at the first sample of a chunk created a step.
+    This encoder keeps both filters continuous across chunks:
+
+    * one stateful DC blocker (no per-chunk mean removal), and
+    * smooth gain attack/release, with an immediate emergency attack only
+      when a sample would otherwise hit the limiter.
+
+    Samples are clamped before conversion, so model overshoot cannot wrap.
     """
 
-    def __init__(self, target_peak: float = 0.95, max_gain: float = 10.0) -> None:
+    def __init__(
+        self,
+        target_peak: float = 0.95,
+        max_gain: float = 10.0,
+        sample_rate: int = 24000,
+        attack_ms: float = 3.0,
+        release_ms: float = 60.0,
+        dc_r: float = 0.995,
+    ) -> None:
+        import math
         from array import array
 
         self._array = array
-        self._target_peak = target_peak
-        self._max_gain = max_gain
+        self._target_peak = max(0.05, min(1.0, target_peak))
+        self._max_gain = max(1.0, max_gain)
+        self._dc_r = max(0.0, min(0.99999, dc_r))
+        self._x_prev: float | None = None
+        self._y_prev = 0.0
         self._gain: float | None = None
+        attack_s = max(0.0005, attack_ms / 1000.0)
+        release_s = max(0.0005, release_ms / 1000.0)
+        self._attack = 1.0 - math.exp(-1.0 / (attack_s * sample_rate))
+        self._release = 1.0 - math.exp(-1.0 / (release_s * sample_rate))
+
+    def _dc_block(self, values: list[float]) -> list[float]:
+        if self._x_prev is None:
+            # Start from the first sample so a non-zero first chunk cannot
+            # produce an initial DC thump.
+            self._x_prev = values[0]
+        out: list[float] = []
+        for value in values:
+            filtered = value - self._x_prev + self._dc_r * self._y_prev
+            self._x_prev = value
+            self._y_prev = filtered
+            out.append(filtered)
+        return out
 
     def encode(self, audio) -> bytes:
         values = _decoded_values(audio)
@@ -117,24 +157,30 @@ class Pcm16StreamEncoder:
         if not values:
             return b""
 
-        mean = sum(values) / len(values)
-        filtered = [v - mean for v in values]
+        filtered = self._dc_block(values)
         peak = max(abs(v) for v in filtered)
         if peak <= 0:
             return bytes(len(filtered) * 2)
         desired = min(self._target_peak / peak, self._max_gain)
-        if self._gain is None or desired < self._gain:
-            # Immediate attack: a newly loud chunk must never clip while the
-            # smoother catches up.
+        if self._gain is None:
             self._gain = desired
-        else:
-            # Gradual recovery avoids pumping on quiet tails/chunks.
-            self._gain += 0.5 * (desired - self._gain)
 
         out = self._array("h")
+        gain = self._gain
+        attack, release = self._attack, self._release
+        limit = self._target_peak
         for v in filtered:
-            sample = max(-1.0, min(1.0, v * self._gain))
+            if abs(v) * gain > limit:
+                # A smoothed attack would stay above the limiter and
+                # flat-top the waveform. Drop straight to the chunk target.
+                gain = desired
+            elif desired < gain:
+                gain += attack * (desired - gain)
+            else:
+                gain += release * (desired - gain)
+            sample = max(-limit, min(limit, v * gain))
             out.append(int(round(sample * 32767.0)))
+        self._gain = gain
         return out.tobytes()
 
 
@@ -172,7 +218,7 @@ class PocketTtsBackend(TtsBackend):
 
     name = "pocket-tts"
 
-    def __init__(self) -> None:
+    def __init__(self, verify_models: bool = True, manifest_path: str | None = None) -> None:
         self._model = None
         self._voice_state = None
         self._voice_key: tuple | None = None
@@ -181,13 +227,73 @@ class PocketTtsBackend(TtsBackend):
         self._mode = "preset"
         self._logged = False
         self._lock = threading.RLock()
+        # Verification is on by default for the real backend. Adapter tests
+        # inject a fake `pocket_tts` and disable it; the verifier itself has
+        # separate deterministic tests with synthetic assets.
+        self._verify_models = verify_models
+        self._manifest_path = manifest_path
+        self._integrity_error: str | None = None
+        # Set by the pipeline when a producer ignores `stop` past the bounded
+        # shutdown wait. This is a fail-closed flag for every entry point
+        # (streaming, sentence fallback, and /v1/tts), not only the pipeline.
+        self._producer_stalled = threading.Event()
+
+    def _verify_model_assets(self, has_cloning: bool, model_config=None) -> dict:
+        """Verify the checkpoint actually selected by Pocket TTS.
+
+        The loader may fall back to the public non-cloning checkpoint for
+        preset mode. Select the manifest entry from that resolved state, then
+        require the config's exact HF revision and the local file digest to
+        agree with it before the model is assigned for use.
+        """
+        from .model_manifest import verify_runtime_manifest
+
+        if model_config is None:
+            from pocket_tts.models.tts_model import CONFIGS_DIR, load_config
+
+            model_config = load_config(CONFIGS_DIR / "english.yaml")
+        if has_cloning:
+            model_source = model_config.weights_path
+        else:
+            model_source = model_config.weights_path_without_voice_cloning
+        if not model_source:
+            raise ModelIntegrityError("model config has no checkpoint source")
+        tokenizer_source = model_config.flow_lm.lookup_table.tokenizer_path
+        if not tokenizer_source:
+            raise ModelIntegrityError("model config has no tokenizer source")
+        return verify_runtime_manifest(
+            manifest_path=self._manifest_path,
+            cloning_available=has_cloning,
+            model_source=model_source,
+            tokenizer_source=tokenizer_source,
+        )
+
+    def report_producer_stalled(self) -> None:
+        """Fail closed after a producer ignores the stop timeout."""
+        self._producer_stalled.set()
+
+    def report_producer_recovered(self) -> None:
+        """The stalled producer exited; new synthesis may be admitted."""
+        self._producer_stalled.clear()
 
     def _ensure_locked(self, config: TtsConfig):
         from pocket_tts import TTSModel
 
+        if self._integrity_error is not None:
+            raise ModelIntegrityError(self._integrity_error)
         if self._model is None:
-            self._model = TTSModel.load_model()
-            self._has_cloning = bool(getattr(self._model, "has_voice_cloning", False))
+            model = TTSModel.load_model()
+            has_cloning = bool(getattr(model, "has_voice_cloning", False))
+            if self._verify_models:
+                try:
+                    self._verify_model_assets(has_cloning)
+                except ModelIntegrityError as exc:
+                    # Cache the failure: do not reload/download 200+ MB on every
+                    # subsequent request when the pinned asset is wrong.
+                    self._integrity_error = str(exc)
+                    raise
+            self._model = model
+            self._has_cloning = has_cloning
         if config.mode == "clone":
             if not config.voice_ref:
                 raise VoiceCloningUnavailable(
@@ -253,6 +359,18 @@ class PocketTtsBackend(TtsBackend):
             self._ensure_locked(config)
             return self.describe()
 
+    def warm(self, config: TtsConfig) -> None:
+        """Preflight and run one short synthesis.
+
+        The first Pocket TTS decode is much slower and emits much larger
+        chunks than subsequent decodes (observed 0.42x real-time cold vs
+        1.1-1.2x warm). Without this, the first live segment can underrun.
+        Startup-only; output is discarded.
+        """
+        self.preflight(config)
+        for _ in self.synthesize_stream("Ready.", config):
+            pass
+
     def describe(self) -> dict:
         return {
             "backend": self.name,
@@ -262,6 +380,8 @@ class PocketTtsBackend(TtsBackend):
         }
 
     def synthesize_full(self, text: str, config: TtsConfig) -> bytes:
+        if self._producer_stalled.is_set():
+            raise TtsBusy("tts producer is still shutting down")
         # Serialize ensure + inference: the model is single-instance and not
         # thread-safe across overlapping turns/sessions.
         with self._lock:
@@ -274,9 +394,11 @@ class PocketTtsBackend(TtsBackend):
         arrives in a fraction of a second instead of after the whole segment
         is synthesized (the dominant first-audio latency at segment sizes of
         100–400 chars). `stop` aborts mid-generation for barge-in."""
+        if self._producer_stalled.is_set():
+            raise TtsBusy("tts producer is still shutting down")
         with self._lock:
             model, voice_state = self._ensure_locked(config)
-            encoder = Pcm16StreamEncoder()
+            encoder = Pcm16StreamEncoder(sample_rate=self.sample_rate)
             for chunk in model.generate_audio_stream(voice_state, text, stop=stop):
                 pcm = encoder.encode(chunk)
                 if pcm:

@@ -13,6 +13,8 @@ import asyncio
 import base64
 import binascii
 import json
+import os
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -39,6 +41,7 @@ from .protocol import (
     should_answer_ping,
     validate_audio_frame,
     validate_envelope,
+    validate_playback_metrics,
 )
 from .stt import FasterWhisperBackend, SttConfig, StubSttBackend
 from .transcribe import (
@@ -168,6 +171,78 @@ async def http_client():
     return _httpx_client
 
 
+def _read_rss_mb() -> int:
+    """Current RSS from /proc when available; otherwise peak RSS via resource."""
+    try:
+        with open("/proc/self/statm", encoding="ascii") as handle:
+            pages = int(handle.read().split()[1])
+        return int(pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024))
+    except Exception:
+        pass
+    try:
+        import resource
+
+        peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        # Linux reports KiB, macOS reports bytes.
+        return int(peak / (1024 if sys.platform != "darwin" else 1024 * 1024))
+    except Exception:
+        return 0
+
+
+def _read_cpu_throttle() -> tuple[int, int] | None:
+    """cgroup v2 cumulative throttle counters, when the kernel exposes them."""
+    try:
+        values: dict[str, int] = {}
+        with open("/sys/fs/cgroup/cpu.stat", encoding="ascii") as handle:
+            for line in handle:
+                key, _, raw = line.partition(" ")
+                if key in ("nr_throttled", "throttled_usec"):
+                    values[key] = int(raw.strip())
+        if "nr_throttled" in values and "throttled_usec" in values:
+            return values["nr_throttled"], values["throttled_usec"]
+    except Exception:
+        pass
+    return None
+
+
+async def _sample_runtime() -> None:
+    """Low-overhead process health samples: loop lag, RSS, cgroup throttling.
+
+    These are gauges in /metrics and structured events only on a meaningful
+    change, so a healthy call path stays quiet. No audio/text/PII is read."""
+    previous_throttle = _read_cpu_throttle()
+    while True:
+        started = time.monotonic()
+        await asyncio.sleep(5.0)
+        lag_ms = max(0, int((time.monotonic() - started - 5.0) * 1000))
+        _metrics["event_loop_lag_max_ms"] = max(
+            _metrics.get("event_loop_lag_max_ms", 0), lag_ms
+        )
+        rss_mb = _read_rss_mb()
+        if rss_mb:
+            _metrics["rss_mb"] = rss_mb
+            _metrics["rss_mb_max"] = max(_metrics.get("rss_mb_max", 0), rss_mb)
+        throttle = _read_cpu_throttle()
+        if throttle is not None:
+            _metrics["cpu_throttled_total"] = throttle[0]
+            _metrics["cpu_throttle_usec_total"] = throttle[1]
+        changed = (
+            throttle is not None
+            and previous_throttle is not None
+            and throttle[0] > previous_throttle[0]
+        )
+        if changed:
+            event(
+                logger,
+                "cpu_throttled",
+                delta_events=throttle[0] - previous_throttle[0],
+                delta_usec=max(0, throttle[1] - previous_throttle[1]),
+            )
+        if lag_ms >= 250:
+            event(logger, "event_loop_lag", lag_ms=lag_ms)
+        previous_throttle = throttle
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Fail fast with actionable messages instead of starting a service that
@@ -180,11 +255,18 @@ async def lifespan(app: FastAPI):
     db()  # ensure schema exists before serving
     event(logger, "voice_startup", models="lazy", db=settings.db_path,
           tts_mode=settings.tts_mode, tts_ref_configured=bool(settings.tts_voice_ref),
-          responder=settings.responder)
+          responder=settings.responder, booking_only=settings.booking_only,
+          booking_availability=bool(settings.booking_availability_url))
     # Warm the models in the background so the first turn is not cold.
     warm_task = asyncio.create_task(warm_models())
+    runtime_task = asyncio.create_task(_sample_runtime())
     yield
-    warm_task.cancel()
+    for task in (warm_task, runtime_task):
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
     if _httpx_client is not None:
         try:
             await _httpx_client.aclose()
@@ -916,6 +998,54 @@ async def _handle_socket(websocket: WebSocket) -> None:
                 )
                 return out.text
 
+            async def call_availability_api() -> dict:
+                """Read the portfolio's existing calendar availability directly.
+
+                The RAG booking event is optional and may never arrive for an
+                indirect request. This call is the reliable path; it never
+                invents slots and never books."""
+                if not settings.booking_availability_url:
+                    return booking_flow.parse_availability_response(
+                        0, None, settings.booking_timezone
+                    )
+                try:
+                    client = await http_client()
+                    response = await client.get(
+                        settings.booking_availability_url,
+                        params={
+                            "timeZone": settings.booking_timezone,
+                            "durationMinutes": settings.booking_duration_minutes,
+                        },
+                        timeout=settings.booking_timeout_seconds,
+                    )
+                    try:
+                        body = response.json()
+                    except Exception:
+                        body = {}
+                    return booking_flow.parse_availability_response(
+                        response.status_code, body, settings.booking_timezone
+                    )
+                except Exception:
+                    return booking_flow.parse_availability_response(
+                        0, None, settings.booking_timezone
+                    )
+
+            async def refresh_availability(text: str) -> str:
+                data = await call_availability_api()
+                offer = booking_flow.prepare_offer(data, text)
+                if offer.get("enabled") and offer.get("slots"):
+                    booking.capture_offer(offer, keep_details=True)
+                event(
+                    logger,
+                    "booking_availability",
+                    reason=offer.get("reason"),
+                    slots=len(offer.get("slots") or []),
+                    requested_day=offer.get("requested_day"),
+                )
+                return booking_flow.availability_message(
+                    offer, settings.booking_timezone
+                )
+
             async def call_booking_api(payload: dict) -> dict:
                 if not settings.booking_api_url:
                     return {"status": "failed", "message": "Voice booking is not configured."}
@@ -940,11 +1070,10 @@ async def _handle_socket(websocket: WebSocket) -> None:
                     return {"status": "uncertain", "message": "The booking request timed out."}
 
             def capture_booking(data: dict) -> None:
-                booking.capture_offer(data)
+                booking.capture_offer(data, keep_details=True)
 
             async def rag_stream(text: str):
-                # Pending voice booking turns are deterministic; unrelated turns
-                # fall through to ordinary RAG.
+                # Pending booking turns are deterministic.
                 reply, payload = booking.handle(text, settings.booking_timezone)
                 if reply is not None:
                     yield reply
@@ -959,6 +1088,15 @@ async def _handle_socket(websocket: WebSocket) -> None:
                     else:
                         booking.clear()
                     yield message
+                    return
+                if booking_flow.is_booking_request(text) or booking_flow.wants_fresh_availability(text):
+                    yield await refresh_availability(text)
+                    return
+                if settings.booking_only:
+                    # No portfolio Q&A fallback in booking-only mode: this is
+                    # the containment boundary that prevents contact details or
+                    # unrelated content from being spoken.
+                    yield booking_flow.booking_guidance_message()
                     return
                 client = await http_client()
                 from . import rag_client as rc
@@ -1000,7 +1138,7 @@ async def _handle_socket(websocket: WebSocket) -> None:
 
         def _fast_reply(text: str, obj: object) -> str | None:
             # A concluded conversation speaks the fixed closing (no RAG round
-            # trip); otherwise the existing deterministic greeting fast path.
+            # trip); otherwise the deterministic social/greeting fast path.
             if decision is not None and decision.get("should_end"):
                 return settings.end_call_closing
             return greeting_reply(text, getattr(obj, "avg_logprob", None))
@@ -1029,6 +1167,10 @@ async def _handle_socket(websocket: WebSocket) -> None:
                 ttfb_out=ttfb_out,
             )
         except asyncio.CancelledError:
+            # A cancelled turn may have submitted a booking whose outcome we
+            # never observed. Keep the key so the next explicit confirmation
+            # reconciles rather than booking twice.
+            booking.mark_uncertain()
             return
         # A superseded/cancelled turn may have submitted a booking whose
         # outcome we never observed. Keep the idempotency key so the next
@@ -1053,6 +1195,11 @@ async def _handle_socket(websocket: WebSocket) -> None:
             tts_total_ms=timings.tts_total_ms,
             total_ms=timings.total_ms,
             frames=result.audio_frames,
+            tts_queue_max=timings.tts_queue_max,
+            tts_send_ms=timings.tts_send_ms,
+            tts_frame_gap_max_ms=timings.tts_max_frame_gap_ms,
+            tts_underrun_risk_frames=timings.tts_underrun_risk_frames,
+            tts_producer_wait_ms=timings.tts_producer_wait_ms,
             fast_path=result.fast_path,
             cancelled=result.cancelled,
             error=result.error,
@@ -1288,6 +1435,17 @@ async def _handle_socket(websocket: WebSocket) -> None:
                 # Client confirms its audio queue drained; releases the bounded
                 # auto-end wait so the goodbye is never cut off.
                 playback_done.set()
+            elif etype == "playback_metrics":
+                # Optional browser-side audio telemetry. Numeric fields only;
+                # unknown/free-text fields are dropped by the validator.
+                values = validate_playback_metrics(payload)
+                metric("playback_metrics_received")
+                event(
+                    logger,
+                    "playback_metrics",
+                    turn=env_msg.get("turn_id"),
+                    **values,
+                )
             elif etype == "interrupt":
                 await end_turn_state("interrupted")
                 await send(make_envelope("listening", {}))
@@ -1364,7 +1522,13 @@ async def warm_models() -> None:
                 stamps["stt_error"] = type(exc).__name__
             t = time.time()
             try:
-                if hasattr(tts, "preflight"):
+                warm = getattr(tts, "warm", None)
+                if callable(warm):
+                    # Preflight alone leaves the first decode cold: a short
+                    # discarded synthesis avoids the observed first-segment
+                    # real-time underrun (0.42x cold vs >1.1x warm).
+                    warm(tts_cfg)
+                elif hasattr(tts, "preflight"):
                     tts.preflight(tts_cfg)
                 else:
                     tts.synthesize_full("Ready.", tts_cfg)

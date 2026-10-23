@@ -50,6 +50,20 @@ class MainWiringTest(unittest.TestCase):
         self.assertIn("settings.validation_errors()", self.source)
         self.assertIn("Invalid voice-service configuration", self.source)
 
+    def test_booking_only_reads_availability_directly(self):
+        self.assertIn("call_availability_api", self.source)
+        self.assertIn("settings.booking_availability_url", self.source)
+        self.assertIn("booking_flow.parse_availability_response", self.source)
+        self.assertIn("booking_flow.prepare_offer", self.source)
+        # Containment: booking-only never falls through to portfolio Q&A.
+        self.assertIn("settings.booking_only", self.source)
+        self.assertIn("booking_flow.booking_guidance_message()", self.source)
+
+    def test_playback_metrics_are_validated_before_logging(self):
+        self.assertIn("validate_playback_metrics", self.source)
+        self.assertIn('etype == "playback_metrics"', self.source)
+        self.assertIn("metric(\"playback_metrics_received\")", self.source)
+
     def test_widget_tokens_are_optional_and_project_scoped(self):
         self.assertIn("verify_widget_token", self.source)
         self.assertIn('request.headers.get("x-widget-token", "")', self.source)
@@ -59,6 +73,10 @@ class MainWiringTest(unittest.TestCase):
         # The browser session POST carries the widget token, so the CORS
         # preflight must allow that header.
         self.assertIn('"X-Widget-Token"', self.source)
+
+    def test_startup_tts_warmup_synthesizes_not_just_preflights(self):
+        self.assertIn('warm = getattr(tts, "warm", None)', self.source)
+        self.assertIn("warm(tts_cfg)", self.source)
 
     def test_typed_turn_uses_the_same_pipeline_without_stt(self):
         self.assertIn('etype == "text_message"', self.source)

@@ -3,6 +3,7 @@
 # reference at deploy/reference/voice-ref.wav. Everything else with private
 # audio is excluded; the reference is re-included explicitly below.
 .env
+.env*
 .git
 .github
 .gitignore
@@ -11,10 +12,15 @@ venv
 __pycache__/
 *.pyc
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
 build/
 dist/
 data/
 models/
+.DS_Store
+*.sqlite3*
+*.log
 docs/
 examples/
 infra/

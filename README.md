@@ -60,15 +60,20 @@ service.
 - Realtime voice calls: 16 kHz PCM16 in, 24 kHz PCM16 streamed out.
 - Silero VAD, faster-whisper STT, Pocket TTS (preset or authorized cloned voice).
 - Incremental partial transcripts (internal hypotheses; only the final one is
-  used) and deterministic greeting fast path.
+  used) and a deterministic social/greeting fast path.
 - Barge-in: sustained speech during playback cancels the current turn; a manual
-  interrupt event does the same.
+  interrupt event does the same. If a TTS producer ignores the bounded stop
+  wait, new synthesis fails closed until that producer exits and recovers
+  automatically instead of accumulating threads.
 - Composer dictation (`POST /v1/transcribe`) and read-aloud
   (`POST /v1/tts`) reuse the loaded models, with short-lived HMAC tickets.
 - Per-session history, bounded conversation context, session quotas, and
   turn-level cancellation.
-- Optional portfolio voice booking adapter (availability → slot → details →
-  explicit confirmation → provider result); never announces uncertain bookings.
+- Portfolio booking-only mode (default): direct availability lookup →
+  slot → details → explicit confirmation → provider result. Short greetings
+  and pleasantries get local social replies; unrelated questions receive a
+  booking prompt; no contact channels are disclosed. Never announces
+  uncertain bookings.
 - Generic HTTP backend adapter with SSE streaming, timeouts, and cancellation.
 - SQLite sessions/quotas in one process; no external database.
 
@@ -135,7 +140,7 @@ python3.12 -m venv .venv
 . .venv/bin/activate
 # Linux CPU-only: avoids multi-GB CUDA wheels. On macOS, skip this line and use
 # the standard wheel installed by `pip install -e .`.
-pip install --index-url https://download.pytorch.org/whl/cpu torch
+pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
 pip install -e .
 ```
 
@@ -169,6 +174,13 @@ deterministic and are **not** a substitute for recognition testing.
 Cloned TTS requires the gated `kyutai/pocket-tts` weights, `HF_TOKEN`, and an
 authorized reference (`VOICE_TTS_MODE=clone`, `VOICE_TTS_VOICE_REF`). The
 default `preset` mode needs neither.
+
+At model load the service verifies the checkpoint Pocket TTS actually selected
+(gated or the documented non-gated preset fallback) and the tokenizer against
+[`deploy/model-manifest.json`](deploy/model-manifest.json): exact HF revisions,
+file sizes, and SHA-256. A missing or mismatched asset fails closed before TTS
+is used; there is no silent checkpoint substitution. Override the manifest
+location with `VOICE_MODEL_MANIFEST` if needed.
 
 ### 4. Start
 
@@ -212,6 +224,7 @@ Pushes to `main` publish a `linux/amd64` image to GitHub Container Registry:
 
 ```text
 ghcr.io/jamesugbanu/ai-voice-assistant:<full-commit-sha>
+ghcr.io/jamesugbanu/ai-voice-assistant:main
 ghcr.io/jamesugbanu/ai-voice-assistant:latest
 ```
 
@@ -281,10 +294,13 @@ The portfolio adapter is the default and is preserved:
 
 - `app/rag_client.py` calls the existing `POST /api/rag` SSE contract with
   `mode: "voice"`, `history`, and `timeZone`.
-- `app/booking.py` handles the optional portfolio booking conversation and
-  calls `/api/booking` only after an explicit confirmation.
-- Endpoint names, WebSocket events, audio formats, authentication, origin
-  checks, quotas, and environment variables are unchanged. Existing portfolio
+- `app/booking.py` handles the booking-only conversation and calls
+  `/api/booking/availability` directly, then `/api/booking` only after an
+  explicit confirmation. Set `VOICE_BOOKING_ONLY=0` to restore the portfolio
+  Q&A fallback.
+- Existing endpoint names, WebSocket events, audio formats, authentication,
+  origin checks, quotas, and environment variables remain compatible; the only
+  protocol addition is optional numeric `playback_metrics`. Existing portfolio
   deployments keep working with `VOICE_RESPONDER` unset (default `portfolio`).
 
 ## Repository layout
@@ -328,8 +344,8 @@ DEPLOY.md       reference deployment notes (portfolio-specific)
 - All inference is CPU-bound and serialized per backend on a small host. The
   service is designed for a single uvicorn worker; in-process rate limiters and
   model singletons assume that.
-- Dependency versions are floors, not a lockfile. Pin the built image/digest
-  for reproducible deployments.
+- Pocket TTS is pinned to `4.0.0`; other dependency ranges are not a full
+  lockfile. Pin the built image/digest for reproducible deployments.
 - Recognition quality follows microphone quality. Nigerian-English, Pidgin, and
   other accent accuracy is not claimed as validated.
 - Booking is a portfolio adapter capability, not a core requirement.

@@ -5,8 +5,10 @@ only — no models, no network, no DB.
 import asyncio
 import os
 import sys
+import threading
 import time
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -146,6 +148,31 @@ class IncrementalTurnTest(unittest.IsolatedAsyncioTestCase):
         s, tid = collecting()
         result, _ = await self._run(s, tid, ["Hello world. "], tts=FailingTts())
         self.assertEqual(result.error, "tts_failed")
+        self.assertEqual(s.state, "idle")
+
+    async def test_tts_failure_after_partial_audio_finalizes(self):
+        class PartialFailTts(StubTtsBackend):
+            def synthesize_stream(self, text, config, stop=None):
+                yield b"\x05\x00" * 10
+                raise RuntimeError("decoder died")
+
+        s, tid = collecting()
+        frames: list = []
+
+        async def emit(pcm, final):
+            frames.append((pcm, final))
+
+        res, _ = await run_turn(
+            state=s, turn_id=tid, audio=b"\x10\x00" * 800,
+            cancelled=asyncio.Event(), stt=self.stt, stt_config=SttConfig(),
+            vad=self.vad, vad_threshold=0.0, rag_ask=lambda q: None,
+            rag_stream=lambda q: stream_of(["Hello world. "]),
+            tts=PartialFailTts(), tts_config=TtsConfig(), emit_audio_frame=emit,
+            now_ms=lambda: int(time.monotonic() * 1000),
+        )
+        self.assertIsNone(res.error)
+        self.assertEqual(len([f for f in frames if not f[1]]), 1)
+        self.assertTrue(frames[-1][1])
         self.assertEqual(s.state, "idle")
 
     async def test_stale_turn_is_cancelled(self):
@@ -288,6 +315,29 @@ class IncrementalTurnTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(tim.total_ms, tim.first_audio_ms)
         self.assertGreater(tim.rag_ms, 0)
 
+    async def test_frame_gap_includes_wait_between_segments(self):
+        class SlowSecondTts(StubTtsBackend):
+            def synthesize_stream(self, text, config, stop=None):
+                if "Two" in text:
+                    time.sleep(0.15)
+                yield self.synthesize_full(text, config)
+
+        s, tid = collecting()
+        res, tim = await run_turn(
+            state=s, turn_id=tid, audio=b"\x10\x00" * 800, cancelled=asyncio.Event(),
+            stt=self.stt, stt_config=SttConfig(), vad=self.vad, vad_threshold=0.0,
+            rag_ask=lambda q: None,
+            rag_stream=lambda q: stream_of(["One. ", "Two. "]),
+            tts=SlowSecondTts(), tts_config=TtsConfig(),
+            emit_audio_frame=self._emit,
+            now_ms=lambda: int(time.monotonic() * 1000),
+        )
+        self.assertIsNone(res.error)
+        # The inter-segment wait is an underrun risk too; it must not be hidden
+        # by resetting gap tracking at each segment.
+        self.assertGreaterEqual(tim.tts_max_frame_gap_ms, 140)
+        self.assertGreaterEqual(tim.tts_underrun_risk_frames, 1)
+
     async def test_slow_consumer_applies_backpressure_without_loss(self):
         # 200 chunks > the bounded queue (64): the producer must block and the
         # consumer must drain every chunk, in order, with no deadlock.
@@ -304,7 +354,7 @@ class IncrementalTurnTest(unittest.IsolatedAsyncioTestCase):
                 got.append(pcm[0])
                 await asyncio.sleep(0.001)  # consumer slower than producer
 
-        res, _ = await run_turn(
+        res, tim = await run_turn(
             state=s, turn_id=tid, audio=b"\x10\x00" * 800, cancelled=asyncio.Event(),
             stt=self.stt, stt_config=SttConfig(), vad=self.vad, vad_threshold=0.0,
             rag_ask=lambda q: None, rag_stream=lambda q: stream_of(["Just one segment. "]),
@@ -314,6 +364,12 @@ class IncrementalTurnTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(res.error)
         self.assertEqual(len(got), 200)
         self.assertEqual(got, [i % 256 for i in range(200)])
+        # The bounded queue was exercised and the transport cost was measured:
+        # this is the evidence needed to distinguish synthesis lag from send
+        # stalls during crackle reports.
+        self.assertGreater(tim.tts_queue_max, 0)
+        self.assertGreater(tim.tts_send_ms, 0)
+        self.assertGreater(tim.tts_producer_wait_ms, 0)
 
 
     async def test_interrupt_closes_the_rag_stream(self):
@@ -361,12 +417,12 @@ class IncrementalTurnTest(unittest.IsolatedAsyncioTestCase):
         class StoppableTts(StubTtsBackend):
             def __init__(self):
                 super().__init__()
-                self.saw_stop = False
+                self.stop_event = None
 
             def synthesize_stream(self, text, config, stop=None):
+                self.stop_event = stop
                 for i in range(60):
                     if stop is not None and stop.is_set():
-                        self.saw_stop = True
                         return
                     yield bytes([i % 256, 0])
                     time.sleep(0.002)
@@ -390,9 +446,257 @@ class IncrementalTurnTest(unittest.IsolatedAsyncioTestCase):
             now_ms=lambda: int(time.monotonic() * 1000),
         )
         self.assertTrue(res.cancelled)
-        self.assertTrue(tts.saw_stop, "TTS producer must observe the stop event")
+        self.assertTrue(tts.stop_event.is_set(), "TTS producer must receive a set stop event")
         self.assertEqual(len([f for f in emitted if not f[1]]), 1, "only pre-interrupt audio")
         self.assertFalse(any(final for _, final in emitted), "no final frame after interrupt")
+
+
+    async def test_cancel_while_waiting_for_next_chunk_returns_without_new_chunk(self):
+        """Cancellation must not wait for the producer's next chunk. Before the
+        queue poll, a silent TTS could hold the turn open until its next yield."""
+
+        class WaitingTts(StubTtsBackend):
+            def __init__(self):
+                super().__init__()
+                self.stop_event = None
+
+            def synthesize_stream(self, text, config, stop=None):
+                self.stop_event = stop
+                yield b"\x01\x00" * 10
+                stop.wait(2.0)
+                if stop.is_set():
+                    return
+                yield b"\x02\x00" * 10
+
+        s, tid = collecting()
+        cancelled = asyncio.Event()
+        emitted: list = []
+        tts = WaitingTts()
+
+        async def emit(pcm, final):
+            emitted.append((pcm, final))
+            if not final:
+                cancelled.set()
+
+        started = time.monotonic()
+        res, _ = await run_turn(
+            state=s, turn_id=tid, audio=b"\x10\x00" * 800, cancelled=cancelled,
+            stt=self.stt, stt_config=SttConfig(), vad=self.vad, vad_threshold=0.0,
+            rag_ask=lambda q: None,
+            rag_stream=lambda q: stream_of(["One long segment with no terminator"]),
+            tts=tts, tts_config=TtsConfig(), emit_audio_frame=emit,
+            now_ms=lambda: int(time.monotonic() * 1000),
+        )
+        elapsed = time.monotonic() - started
+        self.assertTrue(res.cancelled)
+        self.assertTrue(tts.stop_event.is_set())
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len([f for f in emitted if not f[1]]), 1)
+        self.assertFalse(any(final for _, final in emitted))
+
+    async def test_cancel_while_producer_blocked_on_full_queue_is_bounded(self):
+        class FloodTts(StubTtsBackend):
+            def __init__(self):
+                super().__init__()
+                self.yielded = 0
+
+            def synthesize_stream(self, text, config, stop=None):
+                for i in range(500):
+                    if stop is not None and stop.is_set():
+                        return
+                    self.yielded += 1
+                    yield bytes([i % 256, 0])
+
+        s, tid = collecting()
+        cancelled = asyncio.Event()
+        frames: list = []
+        tts = FloodTts()
+
+        async def slow_emit(pcm, final):
+            frames.append((pcm, final))
+            if not final:
+                cancelled.set()
+                await asyncio.sleep(0.2)  # let the bounded queue fill
+
+        started = time.monotonic()
+        res, tim = await run_turn(
+            state=s, turn_id=tid, audio=b"\x10\x00" * 800, cancelled=cancelled,
+            stt=self.stt, stt_config=SttConfig(), vad=self.vad, vad_threshold=0.0,
+            rag_ask=lambda q: None, rag_stream=lambda q: stream_of(["Flood segment."]),
+            tts=tts, tts_config=TtsConfig(), emit_audio_frame=slow_emit,
+            now_ms=lambda: int(time.monotonic() * 1000),
+        )
+        elapsed = time.monotonic() - started
+        self.assertTrue(res.cancelled)
+        self.assertLess(elapsed, 1.5)
+        self.assertLess(tts.yielded, 200, "producer must stop near the queue bound")
+        self.assertGreater(tim.tts_producer_wait_ms, 0)
+        self.assertFalse(any(final for _, final in frames))
+
+        # The cancelled queue/producer must not contaminate the next turn.
+        class TwoChunkTts(StubTtsBackend):
+            def synthesize_stream(self, text, config, stop=None):
+                yield b"\x03\x00" * 10
+                yield b"\x04\x00" * 10
+
+        s2, tid2 = collecting()
+        got: list = []
+
+        async def emit(pcm, final):
+            got.append((pcm, final))
+
+        res2, _ = await run_turn(
+            state=s2, turn_id=tid2, audio=b"\x10\x00" * 800,
+            cancelled=asyncio.Event(), stt=self.stt, stt_config=SttConfig(),
+            vad=self.vad, vad_threshold=0.0, rag_ask=lambda q: None,
+            rag_stream=lambda q: stream_of(["One. "]), tts=TwoChunkTts(),
+            tts_config=TtsConfig(), emit_audio_frame=emit,
+            now_ms=lambda: int(time.monotonic() * 1000),
+        )
+        self.assertIsNone(res2.error)
+        self.assertEqual([pcm for pcm, final in got if not final], [b"\x03\x00" * 10, b"\x04\x00" * 10])
+        self.assertTrue(got[-1][1])
+
+    async def test_cancel_during_slow_transport_returns_promptly(self):
+        class EndlessTts(StubTtsBackend):
+            def __init__(self):
+                super().__init__()
+                self.stop_event = None
+
+            def synthesize_stream(self, text, config, stop=None):
+                self.stop_event = stop
+                i = 0
+                while stop is None or not stop.is_set():
+                    yield bytes([i % 256, 0])
+                    i += 1
+
+        s, tid = collecting()
+        cancelled = asyncio.Event()
+        started = asyncio.Event()
+        tts = EndlessTts()
+
+        async def emit(pcm, final):
+            if final:
+                return
+            started.set()
+            await asyncio.sleep(5)  # a stalled WebSocket send
+
+        task = asyncio.create_task(run_turn(
+            state=s, turn_id=tid, audio=b"\x10\x00" * 800, cancelled=cancelled,
+            stt=self.stt, stt_config=SttConfig(), vad=self.vad, vad_threshold=0.0,
+            rag_ask=lambda q: None, rag_stream=lambda q: stream_of(["One segment."]),
+            tts=tts, tts_config=TtsConfig(), emit_audio_frame=emit,
+            now_ms=lambda: int(time.monotonic() * 1000),
+        ))
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        t0 = time.monotonic()
+        cancelled.set()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertTrue(tts.stop_event.is_set())
+
+
+class ProducerContainmentTest(unittest.IsolatedAsyncioTestCase):
+    """A backend that ignores `stop` must not accumulate producers.
+
+    Python cannot kill a running thread. The pipeline therefore closes the
+    admission gate after the bounded stop timeout and keeps it closed until
+    that producer actually exits; subsequent turns fail closed (and do not
+    start another synthesis thread), then recover automatically.
+    """
+
+    def setUp(self):
+        self.stt = StubSttBackend("hello james")
+        self.vad = StubVadBackend(threshold=0.0)
+
+    async def _run(self, tts, cancelled=None, emit=None):
+        s, tid = collecting()
+        return await run_turn(
+            state=s, turn_id=tid, audio=b"\x10\x00" * 800,
+            cancelled=cancelled or asyncio.Event(),
+            stt=self.stt, stt_config=SttConfig(), vad=self.vad,
+            vad_threshold=0.0, rag_ask=lambda q: None,
+            rag_stream=lambda q: stream_of(["One segment. "]),
+            tts=tts, tts_config=TtsConfig(),
+            emit_audio_frame=emit or (lambda pcm, final: None),
+            now_ms=lambda: int(time.monotonic() * 1000),
+        )
+
+    async def test_stalled_producer_fails_closed_then_recovers(self):
+        class NonCooperativeTts(StubTtsBackend):
+            def __init__(self):
+                super().__init__()
+                self.starts = 0
+                self.delay = 0.45
+                self.sleeping = threading.Event()
+                self.done = threading.Event()
+                self.stalled_reports = 0
+                self.recovered_reports = 0
+
+            def report_producer_stalled(self):
+                self.stalled_reports += 1
+
+            def report_producer_recovered(self):
+                self.recovered_reports += 1
+
+            def synthesize_stream(self, text, config, stop=None):
+                self.starts += 1
+                try:
+                    yield b"\x01\x00" * 10
+                    self.sleeping.set()
+                    time.sleep(self.delay)  # deliberately ignore `stop`
+                    yield b"\x02\x00" * 10
+                finally:
+                    self.done.set()
+
+        tts = NonCooperativeTts()
+        cancelled = asyncio.Event()
+
+        async def first_emit(pcm, final):
+            if not final:
+                # Cancel only once the producer is inside its uncooperative
+                # block, so this proves containment rather than cooperative
+                # iterator close.
+                await asyncio.to_thread(tts.sleeping.wait, 1.0)
+                cancelled.set()
+
+        with patch("app.pipeline._PRODUCER_STOP_TIMEOUT_S", 0.12):
+            started = time.monotonic()
+            res1, _ = await self._run(tts, cancelled=cancelled, emit=first_emit)
+            first_elapsed = time.monotonic() - started
+
+        self.assertTrue(res1.cancelled)
+        self.assertLess(first_elapsed, 0.6)
+        self.assertEqual(tts.starts, 1)
+        self.assertEqual(tts.stalled_reports, 1)
+        self.assertFalse(tts.done.is_set(), "producer should still be stuck")
+
+        # Repeated turns while the stuck producer lives must not start another
+        # synthesis thread; they fail closed promptly.
+        started = time.monotonic()
+        res2, _ = await self._run(tts)
+        second_elapsed = time.monotonic() - started
+        self.assertEqual(res2.error, "tts_failed")
+        self.assertLess(second_elapsed, 0.4)
+        self.assertEqual(tts.starts, 1)
+
+        # Let the original producer exit; the completion callback reopens the
+        # gate and the same backend becomes usable again.
+        await asyncio.wait_for(asyncio.to_thread(tts.done.wait), timeout=2.0)
+        tts.delay = 0.0
+        await asyncio.sleep(0.05)
+        self.assertEqual(tts.recovered_reports, 1)
+        frames = []
+
+        def emit(pcm, final):
+            frames.append((pcm, final))
+
+        res3, _ = await self._run(tts, emit=emit)
+        self.assertIsNone(res3.error)
+        self.assertEqual(tts.starts, 2)
+        self.assertTrue(frames[-1][1])
 
 
 class RagTtfbTimingsTest(unittest.IsolatedAsyncioTestCase):

@@ -8,10 +8,13 @@ import threading
 import time
 import types
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.tts import PocketTtsBackend, TtsConfig, VoiceCloningUnavailable
+from app.model_manifest import ModelIntegrityError
+from app.tts import PocketTtsBackend, TtsBusy, TtsConfig, VoiceCloningUnavailable
 
 
 class FakeArray:
@@ -53,6 +56,7 @@ class FakeModel:
         self.state_calls = []
         self.state_kwargs = []
         self.gen_calls = []
+        self.stream_calls = []
         self.delay = delay
         self._active = 0
         self.max_active = 0
@@ -75,6 +79,7 @@ class FakeModel:
 
     def generate_audio_stream(self, state, text, stop=None):
         # Three decoded chunks stand in for a streamed segment.
+        self.stream_calls.append(text)
         for _ in range(3):
             if stop is not None and stop.is_set():
                 return
@@ -109,7 +114,7 @@ class AdapterTest(unittest.TestCase):
     def test_preset_mode_uses_preset_voice(self):
         m = FakeModel(has_cloning=False)
         install_fake_pocket(m)
-        b = PocketTtsBackend()
+        b = PocketTtsBackend(verify_models=False)
         b.synthesize_full("hello there", TtsConfig(mode="preset", preset_voice="alba"))
         self.assertEqual(m.state_calls, ["alba"])
         self.assertEqual(m.state_kwargs, [{"truncate": False}])
@@ -119,27 +124,27 @@ class AdapterTest(unittest.TestCase):
 
     def test_clone_mode_without_cloning_support_fails_explicitly(self):
         install_fake_pocket(FakeModel(has_cloning=False))
-        b = PocketTtsBackend()
+        b = PocketTtsBackend(verify_models=False)
         with self.assertRaises(VoiceCloningUnavailable) as c:
             b.synthesize_full("hi", TtsConfig(mode="clone", voice_ref=self.tmp.name))
         self.assertIn("gated", str(c.exception))
 
     def test_clone_mode_missing_file_fails(self):
         install_fake_pocket(FakeModel(has_cloning=True))
-        b = PocketTtsBackend()
+        b = PocketTtsBackend(verify_models=False)
         with self.assertRaises(VoiceCloningUnavailable):
             b.synthesize_full("hi", TtsConfig(mode="clone", voice_ref="/no/such/ref.wav"))
 
     def test_clone_mode_without_ref_fails(self):
         install_fake_pocket(FakeModel(has_cloning=True))
-        b = PocketTtsBackend()
+        b = PocketTtsBackend(verify_models=False)
         with self.assertRaises(VoiceCloningUnavailable):
             b.synthesize_full("hi", TtsConfig(mode="clone", voice_ref=""))
 
     def test_clone_mode_success_and_state_reuse(self):
         m = FakeModel(has_cloning=True)
         install_fake_pocket(m)
-        b = PocketTtsBackend()
+        b = PocketTtsBackend(verify_models=False)
         cfg = TtsConfig(mode="clone", voice_ref=self.tmp.name)
         out1 = b.synthesize_full("one", cfg)
         out2 = b.synthesize_full("two", cfg)
@@ -152,7 +157,7 @@ class AdapterTest(unittest.TestCase):
     def test_replacing_reference_at_same_path_reloads_voice_state(self):
         m = FakeModel(has_cloning=True)
         install_fake_pocket(m)
-        b = PocketTtsBackend()
+        b = PocketTtsBackend(verify_models=False)
         cfg = TtsConfig(mode="clone", voice_ref=self.tmp.name)
         b.synthesize_full("one", cfg)
         with open(self.tmp.name, "wb") as handle:
@@ -166,7 +171,7 @@ class AdapterTest(unittest.TestCase):
     def test_switching_mode_reuses_distinct_states(self):
         m = FakeModel(has_cloning=True)
         install_fake_pocket(m)
-        b = PocketTtsBackend()
+        b = PocketTtsBackend(verify_models=False)
         b.synthesize_full("a", TtsConfig(mode="preset", preset_voice="alba"))
         b.synthesize_full("b", TtsConfig(mode="clone", voice_ref=self.tmp.name))
         self.assertEqual(len(m.state_calls), 2)
@@ -174,7 +179,7 @@ class AdapterTest(unittest.TestCase):
     def test_concurrent_synthesis_is_serialized(self):
         m = FakeModel(has_cloning=False, delay=0.02)
         install_fake_pocket(m)
-        b = PocketTtsBackend()
+        b = PocketTtsBackend(verify_models=False)
         cfg = TtsConfig(mode="preset")
         threads = [threading.Thread(target=b.synthesize_full, args=(f"t{i}", cfg)) for i in range(4)]
         for t in threads:
@@ -183,24 +188,97 @@ class AdapterTest(unittest.TestCase):
             t.join()
         self.assertEqual(m.max_active, 1)  # lock prevents overlapping inference
 
+    def test_reported_producer_stall_fails_closed_until_recovered(self):
+        m = FakeModel(has_cloning=False)
+        install_fake_pocket(m)
+        b = PocketTtsBackend(verify_models=False)
+        cfg = TtsConfig(mode="preset", preset_voice="alba")
+        b.report_producer_stalled()
+        with self.assertRaises(TtsBusy):
+            b.synthesize_full("blocked", cfg)
+        with self.assertRaises(TtsBusy):
+            list(b.synthesize_stream("blocked", cfg))
+        self.assertEqual(m.gen_calls, [])
+        self.assertEqual(m.stream_calls, [])
+        b.report_producer_recovered()
+        b.synthesize_full("admitted", cfg)
+        self.assertEqual(m.gen_calls, ["admitted"])
+
     def test_preflight_reports_without_path(self):
         install_fake_pocket(FakeModel(has_cloning=False))
-        b = PocketTtsBackend()
+        b = PocketTtsBackend(verify_models=False)
         d = b.preflight(TtsConfig(mode="preset"))
         self.assertEqual(set(d), {"backend", "mode", "cloning_available", "cloning_active"})
         self.assertNotIn(self.tmp.name, str(d))
 
     def test_synthesize_stream_yields_multiple_pcm_chunks(self):
         install_fake_pocket(FakeModel(has_cloning=True))
-        b = PocketTtsBackend()
+        b = PocketTtsBackend(verify_models=False)
         chunks = list(b.synthesize_stream("hello there", TtsConfig(mode="preset")))
         self.assertGreaterEqual(len(chunks), 2)
         self.assertTrue(all(isinstance(c, bytes) and len(c) > 0 for c in chunks))
         self.assertTrue(b.supports_incremental())
 
+    def test_warm_preflights_and_runs_one_short_synthesis(self):
+        m = FakeModel(has_cloning=False)
+        install_fake_pocket(m)
+        b = PocketTtsBackend(verify_models=False)
+        b.warm(TtsConfig(mode="preset", preset_voice="alba"))
+        self.assertEqual(m.state_calls, ["alba"])
+        self.assertEqual(m.stream_calls, ["Ready."])
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModelVerificationWiringTest(unittest.TestCase):
+    """The adapter verifies whichever checkpoint Pocket TTS actually loaded."""
+
+    def setUp(self):
+        self.cfg = SimpleNamespace(
+            weights_path="hf://kyutai/pocket-tts/model.safetensors@rev-gated",
+            weights_path_without_voice_cloning=(
+                "hf://kyutai/pocket-tts-without-voice-cloning/model.safetensors@rev-public"
+            ),
+            flow_lm=SimpleNamespace(
+                lookup_table=SimpleNamespace(
+                    tokenizer_path="hf://kyutai/pocket-tts-without-voice-cloning/tokenizer.json@rev-tok"
+                )
+            ),
+        )
+
+    def test_selects_gated_checkpoint_when_cloning_is_active(self):
+        backend = PocketTtsBackend(manifest_path="custom-manifest.json")
+        with patch("app.model_manifest.verify_runtime_manifest", return_value={}) as verify:
+            backend._verify_model_assets(True, self.cfg)
+        kwargs = verify.call_args.kwargs
+        self.assertEqual(kwargs["manifest_path"], "custom-manifest.json")
+        self.assertTrue(kwargs["cloning_available"])
+        self.assertEqual(kwargs["model_source"], self.cfg.weights_path)
+        self.assertEqual(
+            kwargs["tokenizer_source"], self.cfg.flow_lm.lookup_table.tokenizer_path
+        )
+
+    def test_selects_public_checkpoint_after_loader_fallback(self):
+        backend = PocketTtsBackend()
+        with patch("app.model_manifest.verify_runtime_manifest", return_value={}) as verify:
+            backend._verify_model_assets(False, self.cfg)
+        kwargs = verify.call_args.kwargs
+        self.assertFalse(kwargs["cloning_available"])
+        self.assertEqual(
+            kwargs["model_source"], self.cfg.weights_path_without_voice_cloning
+        )
+
+    def test_missing_fallback_source_fails_before_resolution(self):
+        backend = PocketTtsBackend()
+        self.cfg.weights_path_without_voice_cloning = None
+        with (
+            patch("app.model_manifest.verify_runtime_manifest") as verify,
+            self.assertRaises(ModelIntegrityError),
+        ):
+            backend._verify_model_assets(False, self.cfg)
+        verify.assert_not_called()
 
 
 class Pcm16NormalizationTest(unittest.TestCase):
@@ -264,6 +342,21 @@ class Pcm16StreamEncoderTest(unittest.TestCase):
         self.assertGreater(max(abs(v) for v in second), 0)
         self.assertLessEqual(max(abs(v) for v in second), int(0.96 * 32767))
 
+    def test_loud_onset_is_not_flat_topped_during_gain_attack(self):
+        import math
+        import struct
+
+        from app.tts import Pcm16StreamEncoder
+
+        enc = Pcm16StreamEncoder()
+        enc.encode([0.01, -0.01] * 40)
+        raw = enc.encode(
+            [0.7 * math.cos(2 * math.pi * 440 * i / 24000) for i in range(120)]
+        )
+        vals = struct.unpack(f"<{len(raw)//2}h", raw)
+        at_limit = sum(abs(v) >= int(0.949 * 32767) for v in vals[:72])
+        self.assertLessEqual(at_limit, 2)
+
     def test_out_of_range_model_samples_are_clipped_not_wrapped(self):
         from app.tts import Pcm16StreamEncoder
         import struct
@@ -279,3 +372,42 @@ class Pcm16StreamEncoderTest(unittest.TestCase):
         raw = enc.encode([0.0] * 40)
         vals = struct.unpack(f"<{len(raw)//2}h", raw)
         self.assertEqual(set(vals), {0})
+
+
+class Pcm16StreamContinuityTest(unittest.TestCase):
+    def test_chunk_boundary_is_not_a_dc_step(self):
+        import math
+        import struct
+
+        from app.tts import Pcm16StreamEncoder
+
+        rate = 24000
+        values = [
+            0.25 + 0.3 * math.sin(2 * math.pi * 37 * n / rate)
+            for n in range(600)
+        ]
+        enc = Pcm16StreamEncoder(sample_rate=rate)
+        split = 251  # deliberately not a zero crossing
+        left_raw = enc.encode(values[:split])
+        right_raw = enc.encode(values[split:])
+        left = struct.unpack(f"<{len(left_raw)//2}h", left_raw)
+        right = struct.unpack(f"<{len(right_raw)//2}h", right_raw)
+        boundary_step = abs(left[-1] - right[0])
+        intra_steps = max(
+            max(abs(left[i] - left[i - 1]) for i in range(1, len(left))),
+            max(abs(right[i] - right[i - 1]) for i in range(1, len(right))),
+        )
+        # Neither per-chunk mean removal nor a gain switch may add a boundary
+        # discontinuity larger than normal waveform motion.
+        self.assertLessEqual(boundary_step, intra_steps * 2)
+
+    def test_constant_dc_offset_is_removed_across_chunks(self):
+        import struct
+
+        from app.tts import Pcm16StreamEncoder
+
+        enc = Pcm16StreamEncoder(target_peak=1.0, max_gain=1.0)
+        first = struct.unpack("<1000h", enc.encode([0.4] * 1000))
+        second = struct.unpack("<1000h", enc.encode([0.4] * 1000))
+        self.assertLessEqual(max(abs(v) for v in first), 50)
+        self.assertLessEqual(max(abs(v) for v in second), 50)

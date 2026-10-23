@@ -102,7 +102,12 @@ bearer-auth change, which ships with the normal site deploy.
 
 By default `VOICE_TTS_MODE=preset` speaks the built-in Pocket TTS voice
 (`VOICE_TTS_PRESET_VOICE`, default `alba`) — a natural voice, but **not** the
-cloned voice. To use the authorized reference on the host:
+cloned voice. `pocket-tts==4.0.0` pins the model configuration; the exact
+upstream revisions and SHA-256 values are recorded in
+[`deploy/model-manifest.json`](deploy/model-manifest.json). The service verifies
+the selected checkpoint and tokenizer against that manifest at load and fails
+closed on a mismatch (override the path with `VOICE_MODEL_MANIFEST`). To use the
+authorized reference on the host:
 
 1. Copy the prepared reference (from `scripts/prepare-voice-reference.py`)
    to `./voice-reference/processed/voice-ref.wav` next to `docker-compose.yml`.

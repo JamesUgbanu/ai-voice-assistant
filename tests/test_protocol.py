@@ -14,6 +14,7 @@ from app.protocol import (
     should_answer_ping,
     validate_audio_frame,
     validate_envelope,
+    validate_playback_metrics,
     ProtocolError,
 )
 
@@ -92,6 +93,7 @@ class ServerCapabilitiesTest(unittest.TestCase):
         self.assertIn("playback_complete", SERVER_CAPABILITIES)
         self.assertIn("text_message", SERVER_CAPABILITIES)
         self.assertIn("assistant_text", SERVER_CAPABILITIES)
+        self.assertIn("playback_metrics", SERVER_CAPABILITIES)
 
     def test_session_created_carries_capabilities(self):
         env = make_envelope(
@@ -99,6 +101,36 @@ class ServerCapabilitiesTest(unittest.TestCase):
             {"session_id": "s", "max_seconds": 300, "capabilities": sorted(SERVER_CAPABILITIES)},
         )
         self.assertIn("playback_complete", env["payload"]["capabilities"])
+
+
+class PlaybackMetricsTest(unittest.TestCase):
+    def test_accepts_only_bounded_numeric_fields(self):
+        values = validate_playback_metrics({
+            "underruns": 3,
+            "queue_max_ms": 480,
+            "sample_rate": 24000,
+            "notes": "private text must be dropped",
+            "underruns_bad": True,
+            "decode_errors": -1,
+            "dropped_frames": "9",
+        })
+        self.assertEqual(values, {
+            "underruns": 3,
+            "queue_max_ms": 480,
+            "sample_rate": 24000,
+        })
+
+    def test_non_object_is_empty(self):
+        self.assertEqual(validate_playback_metrics("secret"), {})
+        self.assertEqual(validate_playback_metrics(None), {})
+
+    def test_event_is_accepted_from_client(self):
+        env = validate_envelope(
+            {"v": 1, "type": "playback_metrics", "seq": 4, "turn_id": "t1",
+             "payload": {"underruns": 1}},
+            max_bytes=1000, from_client=True,
+        )
+        self.assertEqual(env["type"], "playback_metrics")
 
 
 class PingThrottleTest(unittest.TestCase):
